@@ -20,7 +20,7 @@
  */
 
 import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Context, Duration, Effect, Layer, Scope } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
@@ -55,16 +55,22 @@ export const AsyncIngestLive = Layer.effect(
 		// spawn the worker and make /api/health wait on the worker's SQLite
 		// bootstrap. Cache a lazy initializer instead so the worker only starts
 		// on the first ingest request, but is still shared thereafter.
-		const getClient = yield* Effect.gen(function*() {
+		const [getClient, invalidateClient] = yield* Effect.cachedInvalidateWithTTL(Effect.gen(function*() {
 			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, scope)
 			return yield* RpcClient.make(IngestRpcs).pipe(
 				Effect.provide(protocolContext),
 				Effect.provideService(Scope.Scope, scope),
 			)
-		}).pipe(Effect.cached)
+		}), Duration.infinity)
 		return {
-			ingestTraces: (input, options) => Effect.flatMap(getClient, (client) => client.ingestTraces(input, options)),
-			ingestLogs: (input, options) => Effect.flatMap(getClient, (client) => client.ingestLogs(input, options)),
+			ingestTraces: (input, options) =>
+				Effect.flatMap(getClient, (client) => client.ingestTraces(input, options)).pipe(
+					Effect.onError(() => invalidateClient),
+				),
+			ingestLogs: (input, options) =>
+				Effect.flatMap(getClient, (client) => client.ingestLogs(input, options)).pipe(
+					Effect.onError(() => invalidateClient),
+				),
 		}
 	}),
 )

@@ -24,6 +24,7 @@ const HEALTH_FAST_TIMEOUT_MS = 750
  *  and short enough that a truly-down daemon is still detected
  *  before START_TIMEOUT_MS fires. */
 const HEALTH_PATIENT_TIMEOUT_MS = 3_000
+const INGEST_PROBE_TIMEOUT_MS = 3_000
 
 type HealthShape = {
 	readonly ok: boolean
@@ -155,6 +156,21 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			return await response.json() as HealthShape
 		} catch {
 			return null
+		}
+	}
+
+	const fetchIngestProbe = async () => {
+		try {
+			const postEmpty = (path: string) => fetch(`${config.baseUrl}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+				signal: AbortSignal.timeout(INGEST_PROBE_TIMEOUT_MS),
+			})
+			const [traces, logs] = await Promise.all([postEmpty("/v1/traces"), postEmpty("/v1/logs")])
+			return traces.ok && logs.ok
+		} catch {
+			return false
 		}
 	}
 
@@ -418,7 +434,13 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		// negative here drops us into the spawn path and collides with
 		// any slow-but-healthy daemon sitting on the port.
 		const existing = await getStatus(HEALTH_PATIENT_TIMEOUT_MS)
-		if (existing.managed && existing.running) return existing
+		if (existing.managed && existing.running) {
+			// /api/health can stay healthy after the lazy ingest worker/RPC path
+			// has been poisoned by an interrupted request. Empty OTLP posts are
+			// side-effect free and exercise the same path real exporters need.
+			if (existing.pid === process.pid || await fetchIngestProbe()) return existing
+			if (existing.pid !== null) await stopPid(existing.pid)
+		}
 		if (existing.service !== null && existing.reason) {
 			throw new Error(existing.reason)
 		}
@@ -431,7 +453,10 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			// lock grant, and its initial health response can be slow
 			// while the runtime warms up.
 			const rechecked = await getStatus(HEALTH_PATIENT_TIMEOUT_MS)
-			if (rechecked.managed && rechecked.running) return rechecked
+			if (rechecked.managed && rechecked.running) {
+				if (rechecked.pid === process.pid || await fetchIngestProbe()) return rechecked
+				if (rechecked.pid !== null) await stopPid(rechecked.pid)
+			}
 			if (rechecked.service !== null && rechecked.reason) {
 				throw new Error(rechecked.reason)
 			}
