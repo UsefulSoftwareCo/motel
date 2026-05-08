@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
 import { Effect } from "effect"
-import { isAlive, listAliveEntries, MOTEL_SERVICE_ID, MOTEL_VERSION, type RegistryEntry } from "./registry.js"
+import { isAlive, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, MOTEL_VERSION, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
 const DEFAULT_HOST = "127.0.0.1"
@@ -100,7 +100,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const resolveConfig = (options: DaemonOptions = {}): DaemonConfig => {
 	const repoRoot = path.resolve(options.repoRoot ?? DEFAULT_REPO_ROOT)
 	const workdir = path.resolve(options.workdir ?? process.cwd())
-	const runtimeDir = path.resolve(options.runtimeDir ?? path.join(workdir, ".motel-data"))
+	const runtimeDir = path.resolve(options.runtimeDir ?? motelStateDir())
 	const databasePath = path.resolve(options.databasePath ?? path.join(runtimeDir, "telemetry.sqlite"))
 	const host = options.host ?? DEFAULT_HOST
 	const port = options.port ?? DEFAULT_PORT

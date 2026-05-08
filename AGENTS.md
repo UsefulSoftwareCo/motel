@@ -140,7 +140,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `MOTEL_OTEL_EXPORTER_URL`: defaults to `http://127.0.0.1:27686/v1/traces`
 - `MOTEL_OTEL_LOGS_EXPORTER_URL`: defaults to `http://127.0.0.1:27686/v1/logs`
 - `MOTEL_OTEL_QUERY_URL`: defaults to `http://127.0.0.1:27686`
-- `MOTEL_OTEL_DB_PATH`: defaults to `.motel-data/telemetry.sqlite`
+- `MOTEL_OTEL_DB_PATH`: defaults to `${XDG_STATE_HOME:-~/.local/state}/motel/telemetry.sqlite` (one shared DB per machine; daemon log + lock + instance registry live in the same directory)
 - `MOTEL_OTEL_TRACE_LOOKBACK_MINUTES`: defaults to `1440` (24h)
 - `MOTEL_OTEL_TRACE_LIMIT`: defaults to `100`
 - `MOTEL_OTEL_LOG_LIMIT`: defaults to `80`

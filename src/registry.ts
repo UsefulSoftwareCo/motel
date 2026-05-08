@@ -8,7 +8,15 @@ export const MOTEL_SERVICE_ID = "motel-local-server"
 const stateHome = () =>
 	process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state")
 
-export const registryDir = () => path.join(stateHome(), "motel", "instances")
+/**
+ * The shared, machine-global motel state directory. Holds the SQLite
+ * database, daemon log, daemon lock, and the per-pid instance registry.
+ * One motel daemon serves every project on this machine — there is no
+ * per-cwd state.
+ */
+export const motelStateDir = () => path.join(stateHome(), "motel")
+
+export const registryDir = () => path.join(motelStateDir(), "instances")
 
 export type RegistryEntry = {
 	readonly pid: number

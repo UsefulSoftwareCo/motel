@@ -1,3 +1,6 @@
+import { motelStateDir } from "./registry.js"
+import * as path from "node:path"
+
 const parseBoolean = (value: string | undefined, defaultValue: boolean) => {
 	const normalized = value?.trim().toLowerCase()
 	if (!normalized) return defaultValue
@@ -29,7 +32,7 @@ export const config = {
 		queryUrl: baseUrl,
 		exporterUrl: process.env.MOTEL_OTEL_EXPORTER_URL?.trim() || resolveOtelUrl("/v1/traces"),
 		logsExporterUrl: process.env.MOTEL_OTEL_LOGS_EXPORTER_URL?.trim() || resolveOtelUrl("/v1/logs"),
-		databasePath: process.env.MOTEL_OTEL_DB_PATH?.trim() || `${import.meta.dir}/../.motel-data/telemetry.sqlite`,
+		databasePath: process.env.MOTEL_OTEL_DB_PATH?.trim() || path.join(motelStateDir(), "telemetry.sqlite"),
 		traceLookbackMinutes: parsePositiveInt(process.env.MOTEL_OTEL_TRACE_LOOKBACK_MINUTES, 1440),
 		traceFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_TRACE_LIMIT, 100),
 		logFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_LOG_LIMIT, 80),

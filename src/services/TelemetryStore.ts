@@ -517,6 +517,15 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				-- SQLite silently caps at actual file size for smaller DBs.
 				PRAGMA mmap_size = 268435456;
 			`)
+			// auto_vacuum is a header-level setting: it only takes effect on
+			// an empty DB, or on the next VACUUM after a change. Setting it
+			// here, BEFORE the first CREATE TABLE, is the only path that
+			// makes incremental_vacuum work without a full VACUUM. For
+			// existing DBs that were created before this line moved here
+			// (auto_vacuum=NONE in the file header), we run a one-shot
+			// VACUUM below to convert the database. That conversion is the
+			// only place we're forced to take a brief stop-the-world lock.
+			try { db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`) } catch { /* ignore */ }
 			try {
 				db.exec(`
 					PRAGMA journal_mode = WAL;
@@ -526,6 +535,13 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					-- this the WAL happily runs into the hundreds of MB and queries
 					-- start paying the cost of walking the WAL on every read.
 					PRAGMA wal_autocheckpoint = 4000;
+					-- Hard floor for the WAL file. Auto-checkpoint controls *when*
+					-- pages move out of the WAL; size_limit controls how much the
+					-- WAL file is allowed to grow on disk. 128MB is generous enough
+					-- to absorb a long write burst without blocking on truncation,
+					-- tight enough that a wedged retention loop can't hide a 20GB
+					-- WAL the way a default no-limit configuration can.
+					PRAGMA journal_size_limit = 134217728;
 
 					CREATE TABLE IF NOT EXISTS spans (
 						trace_id TEXT NOT NULL,
@@ -876,6 +892,61 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 		const maxDbSizeBytes = config.otel.maxDbSizeMb * 1024 * 1024
 
+		// Freelist-ratio thresholds for the adaptive reclaim loop. Below the
+		// LOW threshold there's nothing worth doing; above HIGH we are in the
+		// 17GB-DB-with-10GB-freelist failure mode and need to reclaim aggressively
+		// even if it costs writer-lock time.
+		const FREELIST_LOW_RATIO = 0.05
+		const FREELIST_MID_RATIO = 0.20
+		const FREELIST_HIGH_RATIO = 0.50
+		const VACUUM_PAGES_NORMAL = 2000     // ~8MB/pass
+		const VACUUM_PAGES_BUSY = 20000      // ~80MB/pass — used when freelist > 20%
+		const VACUUM_PAGES_PANIC = 50000     // ~200MB/pass — only when ratio > 50%
+
+		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
+
+		const incrementalFtsMerge = (pages: number) => {
+			// FTS5 segment merges drop tombstone rows that DELETE leaves behind.
+			// Without periodic merges, deleted FTS rows stay on disk indefinitely
+			// — a major source of freelist pages on a heavy-deletion workload.
+			// `merge=N` is a bounded, online operation: it merges at most N
+			// pages of work and returns. Per FTS5 docs, missing tables silently
+			// throw; we swallow because not every DB has every FTS table.
+			for (const name of ftsTableNames) {
+				try { db.query(`INSERT INTO ${name}(${name}) VALUES (?)`).run(`merge=${pages}`) } catch { /* table absent or older schema */ }
+			}
+		}
+
+		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
+			yield* Effect.sync(() => {
+				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+				if (pageCount === 0) return
+				const ratio = freePages / pageCount
+				if (ratio < FREELIST_LOW_RATIO) return
+
+				// Adaptive vacuum sizing — fixed 2000 pages/min could not keep
+				// up with sustained deletions, leaking 10GB of freelist over
+				// time. Scale the per-pass work to the size of the backlog so
+				// we stay roughly proportional to the deficit.
+				const pages =
+					ratio >= FREELIST_HIGH_RATIO ? VACUUM_PAGES_PANIC :
+					ratio >= FREELIST_MID_RATIO ? VACUUM_PAGES_BUSY :
+					VACUUM_PAGES_NORMAL
+
+				try { db.exec(`PRAGMA incremental_vacuum(${pages});`) } catch { /* ignore */ }
+
+				// In WAL mode incremental_vacuum only moves pages — the file
+				// shrinks on the next checkpoint. PASSIVE silently skips when
+				// readers are active (the failure mode the agent's research
+				// flagged: checkpoint starvation). Use RESTART normally and
+				// TRUNCATE in panic mode to physically shrink the WAL when it
+				// has grown.
+				const mode = ratio >= FREELIST_HIGH_RATIO ? "TRUNCATE" : "RESTART"
+				try { db.exec(`PRAGMA wal_checkpoint(${mode});`) } catch { /* ignore */ }
+			})
+		})
+
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
 
@@ -949,21 +1020,25 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					// FTS table may not exist on old DBs.
 				}
 
-				// Truncate the WAL after a big delete pass. Without this the
-				// WAL keeps growing (observed: 640MB) because wal_autocheckpoint
-				// only triggers when WAL pages exceed the threshold during
-				// writes — a retention pass that evicts millions of rows can
-				// blow far past that before the auto-checkpoint fires. Using
-				// PASSIVE so active readers aren't interrupted; if the WAL
-				// can't be fully reclaimed right now, we'll try again next
-				// cycle.
-				try { db.exec(`PRAGMA wal_checkpoint(PASSIVE);`) } catch { /* ignore */ }
+				// Checkpoint after a big delete pass so the freed pages land
+				// in the main DB file and become eligible for incremental
+				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
+				// when readers are active, which is the documented mechanism
+				// behind WAL/freelist starvation when ingest is busy.
+				try { db.exec(`PRAGMA wal_checkpoint(RESTART);`) } catch { /* ignore */ }
 
-				// Incremental vacuum reclaims some of the freed pages back
-				// to the OS so the file size actually shrinks over time
-				// instead of just growing the freelist. Bounded to 2000
-				// pages per pass (≈8MB) to avoid a long-running transaction.
-				try { db.exec(`PRAGMA incremental_vacuum(2000);`) } catch { /* ignore */ }
+				// Incremental FTS5 merge — DELETE on an FTS5-indexed row
+				// leaves a tombstone in the segment tree that only `merge`
+				// reclaims. Skipping this is the second compounding cause
+				// (after fixed-size vacuum) of the slow freelist accretion
+				// that took the DB to 17GB. 100 pages of merge work per
+				// retention tick is bounded and runs in milliseconds.
+				incrementalFtsMerge(100)
+
+				// Actual page reclamation lives in `reclaimSpace`, which
+				// runs on its own faster cadence so the file shrinks even
+				// when no traces are evicted in a given retention tick (e.g.
+				// after a large historical eviction has already happened).
 			})
 		})
 
@@ -977,13 +1052,30 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			// daemon look hung even though the port is already bound.
 			yield* Effect.forkScoped(reconcileTraceSummaries)
 
-			// Enable incremental vacuum so retention can reclaim freed
-			// pages over time instead of needing a stop-the-world VACUUM.
-			// Idempotent: repeat calls after the first are no-ops.
-			try { db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`) } catch { /* ignore */ }
+			// auto_vacuum is configured at schema-init time (see above). For
+			// older databases that were created before that line was in
+			// place, the file header still says auto_vacuum=NONE and
+			// incremental_vacuum is silently a no-op. Detect and convert
+			// in a forked fiber so server startup is not blocked by VACUUM
+			// on a multi-GB historical database.
+			yield* Effect.forkScoped(Effect.sync(() => {
+				try {
+					const mode = (db.query(`PRAGMA auto_vacuum`).get() as { auto_vacuum: number }).auto_vacuum
+					if (mode === 2) return // already INCREMENTAL
+					db.exec(`PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`)
+				} catch { /* ignore — new DBs won't need this; conversion will retry next startup */ }
+			}))
 
 			// Run cleanup every 60 seconds in the background, tied to the layer's scope
 			yield* Effect.forkScoped(Effect.repeat(cleanupExpired(), Schedule.spaced("60 seconds")))
+
+			// Page reclamation runs on a separate, faster cadence (10s) and
+			// is independent of the eviction loop. The reason: a single sweep
+			// at 60s intervals can move only ~8MB of pages before the next
+			// burst of inserts grows the freelist again. Decoupling lets us
+			// catch up adaptively (see VACUUM_PAGES_BUSY/PANIC) without
+			// changing the cost of the heavier delete sweep.
+			yield* Effect.forkScoped(Effect.repeat(reclaimSpace(), Schedule.spaced("10 seconds")))
 
 			// Periodically refresh query planner stats. `PRAGMA optimize` is a
 			// no-op when nothing has changed, so this is essentially free on idle

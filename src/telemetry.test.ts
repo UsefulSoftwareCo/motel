@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite"
 import { afterAll, beforeAll, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, References } from "effect"
@@ -221,6 +222,73 @@ describe("motel telemetry store", () => {
 
 	afterAll(() => {
 		rmSync(tempDir, { recursive: true, force: true })
+	})
+
+	it("creates fresh DBs with auto_vacuum=INCREMENTAL", () => {
+		// Headline regression test: PRAGMA auto_vacuum is a header-level
+		// setting that only takes effect when set BEFORE the first CREATE
+		// TABLE, or after a full VACUUM. The previous code set it AFTER
+		// schema init, so every motel DB ever created had auto_vacuum=NONE
+		// and incremental_vacuum was silently a no-op — the documented
+		// mechanism behind the 17GB telemetry.sqlite this test exists to
+		// prevent.
+		const probe = new Database(dbPath, { readonly: true })
+		try {
+			const mode = (probe.query(`PRAGMA auto_vacuum`).get() as { auto_vacuum: number }).auto_vacuum
+			expect(mode).toBe(2) // 2 = INCREMENTAL
+		} finally {
+			probe.close()
+		}
+	})
+
+	it("incremental_vacuum reclaims pages back to the OS after deletes", () => {
+		// Proves the full reclaim chain works on the real schema: DELETE
+		// → wal_checkpoint → incremental_vacuum → page_count drops. With
+		// the previous auto_vacuum=NONE bug, page_count would not change
+		// no matter how many incremental_vacuum calls were made.
+		// Operate on a copy of the seed DB so we don't destroy state that
+		// later tests rely on. Checkpoint first so the copy is consistent.
+		const sourceProbe = new Database(dbPath)
+		try { sourceProbe.exec(`PRAGMA wal_checkpoint(TRUNCATE);`) } finally { sourceProbe.close() }
+		const clonePath = join(tempDir, "telemetry-vacuum-clone.sqlite")
+		copyFileSync(dbPath, clonePath)
+		const probe = new Database(clonePath)
+		try {
+			probe.exec(`PRAGMA busy_timeout = 5000;`)
+
+			// Bulk-insert filler so we have enough pages to make truncation
+			// observable. SQLite frees pages whole-page-at-a-time, so a tiny
+			// fixture (a handful of partial pages) won't yield a measurable
+			// page_count delta. 1000 rows × ~600 bytes = ~600KB ≈ 150 pages.
+			const stmt = probe.prepare(
+				`INSERT INTO spans (trace_id, span_id, parent_span_id, service_name, scope_name, operation_name, kind, start_time_ms, end_time_ms, duration_ms, status, attributes_json, resource_json, events_json) VALUES (?, ?, NULL, 'vac', 'scope', 'op', 'INTERNAL', 0, 0, 0, 'OK', '{}', '{}', '[]')`,
+			)
+			probe.exec(`BEGIN IMMEDIATE;`)
+			const filler = "x".repeat(512)
+			for (let i = 0; i < 1000; i++) {
+				stmt.run(`v${i.toString().padStart(8, "0")}-${filler.slice(0, 40)}`, `s${i.toString(16).padStart(15, "0")}`)
+			}
+			probe.exec(`COMMIT;`)
+
+			const pageCountBefore = (probe.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+			expect(pageCountBefore).toBeGreaterThan(50)
+
+			probe.exec(`DELETE FROM spans WHERE service_name = 'vac';`)
+
+			const freelistAfterDelete = (probe.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+			expect(freelistAfterDelete).toBeGreaterThan(0)
+
+			probe.exec(`PRAGMA wal_checkpoint(RESTART);`)
+			probe.exec(`PRAGMA incremental_vacuum;`)
+			probe.exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+
+			const pageCountAfter = (probe.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+			const freelistAfter = (probe.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+			expect(pageCountAfter).toBeLessThan(pageCountBefore)
+			expect(freelistAfter).toBeLessThan(freelistAfterDelete)
+		} finally {
+			probe.close()
+		}
 	})
 
 	it("filters traces by attr.* fields", async () => {

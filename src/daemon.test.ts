@@ -228,9 +228,13 @@ describe("daemon manager", () => {
 		}
 	}, 20_000)
 
-	test("starts for the caller cwd even when motel is installed elsewhere", async () => {
+	test("uses the shared global state dir regardless of caller cwd", async () => {
 		const projectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-project-")))
-		const databasePath = path.join(projectDir, ".motel-data", "telemetry.sqlite")
+		const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-state-"))
+		const expectedRuntimeDir = path.join(stateRoot, "motel")
+		const expectedDatabasePath = path.join(expectedRuntimeDir, "telemetry.sqlite")
+		const originalXdg = process.env.XDG_STATE_HOME
+		process.env.XDG_STATE_HOME = stateRoot
 		let manager: ReturnType<typeof createDaemonManager> | null = null
 
 		try {
@@ -245,8 +249,9 @@ describe("daemon manager", () => {
 				expect(started.managed).toBe(true)
 				expect(started.workdir).toBe(projectDir)
 				expect(started.sameWorkdir).toBe(true)
-				expect(started.databasePath).toBe(databasePath)
-				expect(started.logPath).toBe(path.join(projectDir, ".motel-data", "daemon.log"))
+				expect(started.databasePath).toBe(expectedDatabasePath)
+				expect(started.logPath).toBe(path.join(expectedRuntimeDir, "daemon.log"))
+				expect(fs.existsSync(path.join(projectDir, ".motel-data"))).toBe(false)
 
 				const reused = await Effect.runPromise(manager.ensure)
 				expect(reused.pid).toBe(started.pid)
@@ -261,6 +266,9 @@ describe("daemon manager", () => {
 				}
 			})
 			fs.rmSync(projectDir, { recursive: true, force: true })
+			fs.rmSync(stateRoot, { recursive: true, force: true })
+			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME
+			else process.env.XDG_STATE_HOME = originalXdg
 		}
 	})
 })
