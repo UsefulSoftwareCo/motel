@@ -350,21 +350,20 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 					const labelIndent = 8 + span.depth * INDENT
 
 					return (
+						// Keyboard activation lives on the parent scroll container
+						// (role="application" with arrow/j/k handlers); rows are
+						// just visual mouse targets. A per-row onKeyDown would be
+						// unreachable because tabIndex isn't set and the parent
+						// owns focus.
+						// react-doctor-disable-next-line jsx-a11y/click-events-have-key-events
 						<div
 							key={span.spanId}
 							className={`absolute left-0 right-0 flex items-stretch cursor-pointer border-b border-white/[0.03] ${
 								sel ? "bg-accent/10" : "hover:bg-white/[0.03]"
 							}`}
 							style={{ top: virtual.start, height: ROW_HEIGHT }}
-							role="button"
-							tabIndex={-1}
+							role="row"
 							onClick={() => onSelectSpan(span.spanId)}
-							onKeyDown={(e) => {
-								if (e.key === "Enter" || e.key === " ") {
-									e.preventDefault()
-									onSelectSpan(span.spanId)
-								}
-							}}
 						>
 							{/* Label column */}
 							<div
