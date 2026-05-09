@@ -95,7 +95,7 @@ function AiTable({ atom }: { atom: any }) {
 							<td className="py-3 px-4 text-right text-sm tabular-nums text-zinc-300">{formatDuration(c.durationMs)}</td>
 							<td className="py-3 px-4 text-right text-sm tabular-nums text-zinc-500">{c.usage?.inputTokens?.toLocaleString() ?? "\u2014"}</td>
 							<td className="py-3 px-4 text-right text-sm tabular-nums text-zinc-500">{c.usage?.outputTokens?.toLocaleString() ?? "\u2014"}</td>
-							<td className="py-3 pl-4 pr-6 text-right text-sm text-zinc-500">{formatRelativeTime(new Date(c.startedAt))}</td>
+							<td className="py-3 pl-4 pr-6 text-right text-sm text-zinc-500">{formatRelativeTime(c.startedAt)}</td>
 						</tr>
 						{expandedId === c.spanId && (
 							<tr key={`${c.spanId}-detail`} className="border-t border-white/5">

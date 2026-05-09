@@ -47,6 +47,25 @@ export const SpanContentView = ({
 	readonly paneWidth: number
 	readonly selectedAttrIndex: number
 }) => {
+	const valueWrapWidth = Math.max(16, contentWidth - VALUE_INDENT.length - CURSOR_WIDTH)
+	const tags = span?.tags
+
+	// Block layout is memoised on tags identity — otherwise every j/k press
+	// would rewrap every attribute's value even though only the highlight
+	// moved. Hooks must be called unconditionally, so this lives above the
+	// `!span` early return and the memo handles the empty case itself.
+	const blocks = useMemo<readonly AttrBlock[]>(() => {
+		if (!tags) return []
+		return Object.entries(tags).map(([key, value]) => {
+			// Word-wrap with a generous line cap — the view is scrollable so
+			// we can afford to show the whole value rather than forcing an
+			// ellipsis. 200 lines covers enormous LLM prompts without
+			// blowing up the render tree.
+			const valueLines = wrapTextLines(value, valueWrapWidth, 200)
+			return { key, valueLines, rowCount: 1 + Math.max(1, valueLines.length) }
+		})
+	}, [tags, valueWrapWidth])
+
 	if (!span) {
 		return (
 			<box flexDirection="column" width={paneWidth} height={bodyLines + SPAN_CONTENT_HEADER_ROWS} overflow="hidden">
@@ -61,24 +80,8 @@ export const SpanContentView = ({
 		)
 	}
 
-	const entries = Object.entries(span.tags)
-	const selected = Math.max(0, Math.min(selectedAttrIndex, entries.length - 1))
-	const valueWrapWidth = Math.max(16, contentWidth - VALUE_INDENT.length - CURSOR_WIDTH)
+	const selected = Math.max(0, Math.min(selectedAttrIndex, blocks.length - 1))
 	const aiFlag = isAiSpan(span.tags)
-
-	// Block layout is memoised on entries identity — otherwise every j/k
-	// press would rewrap every attribute's value even though only the
-	// highlight moved.
-	const blocks = useMemo<readonly AttrBlock[]>(() => {
-		return entries.map(([key, value]) => {
-			// Word-wrap with a generous line cap — the view is scrollable so
-			// we can afford to show the whole value rather than forcing an
-			// ellipsis. 200 lines covers enormous LLM prompts without
-			// blowing up the render tree.
-			const valueLines = wrapTextLines(value, valueWrapWidth, 200)
-			return { key, valueLines, rowCount: 1 + Math.max(1, valueLines.length) }
-		})
-	}, [entries, valueWrapWidth])
 
 	// Viewport: pick the contiguous window of blocks that (a) fits inside
 	// bodyLines and (b) contains the selected block. We find the first
@@ -137,14 +140,14 @@ export const SpanContentView = ({
 					<span fg={colors.separator}>{SEPARATOR}</span>
 					<span fg={colors.muted}>{span.spanId.slice(0, 16)}</span>
 					<span fg={colors.separator}>{SEPARATOR}</span>
-					<span fg={colors.count}>{`${entries.length} tags`}</span>
+					<span fg={colors.count}>{`${blocks.length} tags`}</span>
 					<span fg={colors.separator}>{SEPARATOR}</span>
-					<span fg={colors.muted}>{`${selected + 1}/${entries.length}`}</span>
+					<span fg={colors.muted}>{`${selected + 1}/${blocks.length}`}</span>
 				</TextLine>
 			</box>
 			<Divider width={paneWidth} />
 			<box flexDirection="column" paddingLeft={1} paddingRight={1}>
-				{entries.length === 0 ? (
+				{blocks.length === 0 ? (
 					<PlainLine text="No tags on this span." fg={colors.muted} />
 				) : (
 					visible.map((block, offset) => {
@@ -165,7 +168,7 @@ export const SpanContentView = ({
 									</TextLine>
 								) : (
 									block.valueLines.map((line, i) => (
-										<TextLine key={i}>
+										<TextLine key={`${block.key}-${i}`}>
 											<span fg={colors.separator}>{VALUE_INDENT}</span>
 											<span fg={isSelected ? colors.text : colors.muted}>{line}</span>
 										</TextLine>

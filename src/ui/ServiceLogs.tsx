@@ -26,6 +26,15 @@ export const ServiceLogsView = ({
 	const traceWidth = 8
 	const messageWidth = Math.max(16, contentWidth - timeWidth - levelWidth - traceWidth - 3)
 
+	// Hooks must be called unconditionally — keep them above the early
+	// returns. The data-dependent values below all tolerate a 0-length
+	// data array, so this stays correct in the empty/loading/error cases.
+	const scrollRef = useRef<ScrollBoxRenderable | null>(null)
+	const safeSelectedIndex = Math.max(0, Math.min(selectedIndex, logsState.data.length - 1))
+	useLayoutEffect(() => {
+		scrollRef.current?.scrollChildIntoView(`svc-log-${safeSelectedIndex}`)
+	}, [safeSelectedIndex])
+
 	if (logsState.status === "loading" && logsState.data.length === 0) {
 		return <PlainLine text="Loading recent service logs..." fg={colors.count} />
 	}
@@ -38,18 +47,12 @@ export const ServiceLogsView = ({
 		return <PlainLine text={`No logs captured yet for service ${serviceName ?? "unknown"}.`} fg={colors.muted} />
 	}
 
-	const scrollRef = useRef<ScrollBoxRenderable | null>(null)
-	const safeSelectedIndex = Math.max(0, Math.min(selectedIndex, logsState.data.length - 1))
 	const selectedLog = logsState.data[safeSelectedIndex] ?? null
 	const detailWidth = Math.max(16, contentWidth - 2)
 	const detailBodyLines = selectedLog ? wrapTextLines(selectedLog.body, detailWidth, 6) : []
 	const detailAttributeLines = selectedLog ? relevantLogAttributes(selectedLog).slice(0, 3) : []
 	const detailHeight = selectedLog ? 3 + detailBodyLines.length + detailAttributeLines.length : 0
 	const listHeight = Math.max(4, bodyLines - detailHeight - 1)
-
-	useLayoutEffect(() => {
-		scrollRef.current?.scrollChildIntoView(`svc-log-${safeSelectedIndex}`)
-	}, [safeSelectedIndex])
 
 	return (
 		<box flexDirection="column">

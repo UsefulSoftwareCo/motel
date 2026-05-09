@@ -264,6 +264,8 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 			ref={scrollRef}
 			className="flex-1 overflow-auto min-w-0 outline-none"
 			tabIndex={0}
+			role="application"
+			aria-label="Trace waterfall (use arrow keys to navigate spans)"
 			onKeyDown={handleKeyDown}
 			onWheel={handleWheel}
 		>
@@ -272,6 +274,7 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 				ref={timelineRef}
 				className="sticky top-0 z-20 flex bg-zinc-950 border-b border-white/10 select-none"
 				style={{ height: AXIS_HEIGHT, cursor: isZoomed ? "grab" : "default" }}
+				role="presentation"
 				onMouseDown={handleTimelineMouseDown}
 			>
 				<div
@@ -295,7 +298,7 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 					{ticks.map((t, i) => {
 						const last = i === ticks.length - 1
 						return (
-							<div key={i} className="absolute top-0 bottom-0" style={{ left: `${t.pct}%` }}>
+							<div key={t.ms} className="absolute top-0 bottom-0" style={{ left: `${t.pct}%` }}>
 								<div className="absolute top-0 bottom-0 border-l border-white/5" />
 								<span
 									className="absolute bottom-1 text-sm tabular-nums text-zinc-600 whitespace-nowrap"
@@ -313,9 +316,9 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 			<div className="relative w-full" style={{ height: totalHeight }}>
 				{/* Full-height gridlines aligned with view ticks */}
 				<div className="absolute pointer-events-none" style={{ left: LABEL_WIDTH, right: 0, top: 0, bottom: 0 }}>
-					{ticks.slice(1, -1).map((t, i) => (
+					{ticks.slice(1, -1).map((t) => (
 						<div
-							key={i}
+							key={t.ms}
 							className="absolute top-0 bottom-0 border-l border-white/5"
 							style={{ left: `${t.pct}%` }}
 						/>
@@ -353,7 +356,15 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 								sel ? "bg-accent/10" : "hover:bg-white/[0.03]"
 							}`}
 							style={{ top: virtual.start, height: ROW_HEIGHT }}
+							role="button"
+							tabIndex={-1}
 							onClick={() => onSelectSpan(span.spanId)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter" || e.key === " ") {
+									e.preventDefault()
+									onSelectSpan(span.spanId)
+								}
+							}}
 						>
 							{/* Label column */}
 							<div
@@ -362,7 +373,7 @@ export function Waterfall({ spans, traceStartMs, traceDurationMs, selectedSpanId
 							>
 								{Array.from({ length: span.depth }, (_, i) => (
 									<div
-										key={i}
+										key={`${span.spanId}-depth-${i}`}
 										className="absolute top-0 bottom-0 border-l border-white/5 pointer-events-none"
 										style={{ left: 8 + i * INDENT + 5 }}
 									/>

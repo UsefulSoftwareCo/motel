@@ -61,7 +61,7 @@ export function SpanDetailPanel({ span, logs, onClose }: Props) {
 
 			{span.warnings.length > 0 && (
 				<Section title="Warnings">
-					{span.warnings.map((w, i) => <p key={i} className="text-amber-400 text-sm mb-1">{w}</p>)}
+					{span.warnings.map((w) => <p key={w} className="text-amber-400 text-sm mb-1">{w}</p>)}
 				</Section>
 			)}
 
@@ -80,8 +80,8 @@ export function SpanDetailPanel({ span, logs, onClose }: Props) {
 
 			{span.events.length > 0 && (
 				<Section title={`Events (${span.events.length})`}>
-					{span.events.map((evt, i) => (
-						<div key={i} className="py-2 border-b border-white/5 last:border-0">
+					{span.events.map((evt) => (
+						<div key={`${evt.timestamp.getTime()}-${evt.name}`} className="py-2 border-b border-white/5 last:border-0">
 							<p className="text-sm font-medium text-zinc-200">{evt.name}</p>
 							<p className="text-sm text-zinc-500 tabular-nums">{formatTimestamp(evt.timestamp)}</p>
 							{Object.entries(evt.attributes).length > 0 && (
