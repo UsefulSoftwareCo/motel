@@ -5,34 +5,17 @@ import type { LogItem, TraceItem, TraceSummaryItem } from "../../domain.ts"
 import {
 	activeAttrKeyAtom,
 	activeAttrValueAtom,
-	aiCallDetailStateAtom,
 	autoRefreshAtom,
-	chatDetailChunkIdAtom,
-	chatDetailScrollOffsetAtom,
 	collapsedSpanIdsAtom,
 	detailViewAtom,
-	ensureAiCallDetail,
-	ensureTraceAttributeKeys,
-	ensureTraceAttributeValues,
 	filterModeAtom,
 	filterTextAtom,
-	getCachedAiCallDetail,
-	initialAiCallDetailState,
 	initialLogState,
 	initialServiceLogState,
 	initialTraceDetailState,
-	invalidateAiCallDetailCache,
-	loadFilteredTraceSummaries,
-	loadRecentTraceSummaries,
-	loadServiceLogs,
-	loadTraceDetail,
-	loadTraceLogs,
-	loadTraceServices,
 	logStateAtom,
-	persistSelectedService,
 	refreshNonceAtom,
 	selectedAttrIndexAtom,
-	selectedChatChunkIdAtom,
 	selectedServiceLogIndexAtom,
 	selectedSpanIndexAtom,
 	selectedTraceIndexAtom,
@@ -43,7 +26,28 @@ import {
 	type TraceSortMode,
 	traceSortAtom,
 	traceStateAtom,
-} from "../state.ts"
+} from "../atoms.ts"
+import {
+	aiCallDetailStateAtom,
+	chatDetailChunkIdAtom,
+	chatDetailScrollOffsetAtom,
+	ensureAiCallDetail,
+	getCachedAiCallDetail,
+	initialAiCallDetailState,
+	invalidateAiCallDetailCache,
+	selectedChatChunkIdAtom,
+} from "../aiState.ts"
+import {
+	ensureTraceAttributeKeys,
+	ensureTraceAttributeValues,
+	loadFilteredTraceSummaries,
+	loadRecentTraceSummaries,
+	loadServiceLogs,
+	loadTraceDetail,
+	loadTraceLogs,
+	loadTraceServices,
+} from "../loaders.ts"
+import { persistSelectedService } from "../persistence.ts"
 import { isAiSpan } from "../../domain.ts"
 import { buildChunks, type Chunk } from "../aiChatModel.ts"
 import { parseFilterText } from "../filterParser.ts"

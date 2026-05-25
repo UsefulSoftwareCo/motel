@@ -1,6 +1,6 @@
 import { useMemo } from "react"
 import { fitCell } from "../format.ts"
-import type { DetailView } from "../state.ts"
+import type { DetailView } from "../atoms.ts"
 
 interface UseAppLayoutInput {
 	readonly width: number | undefined

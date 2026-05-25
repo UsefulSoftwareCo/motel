@@ -2,6 +2,10 @@ import { Effect, Layer, Context } from "effect"
 import type { AiCallDetail, SpanItem, TraceItem, TraceSummaryItem } from "../domain.js"
 import { TelemetryStore } from "./TelemetryStore.js"
 
+/**
+ * Compatibility adapter for consumers importing the historical trace query module.
+ * New internal callers should use TelemetryStoreReadonly directly.
+ */
 export class TraceQueryService extends Context.Service<
 	TraceQueryService,
 	{
@@ -22,56 +26,18 @@ export class TraceQueryService extends Context.Service<
 
 export const TraceQueryServiceLive = Layer.effect(
 	TraceQueryService,
-	Effect.gen(function* () {
-		const store = yield* TelemetryStore
-
-		const listServices = Effect.fn("motel/TraceQueryService.listServices")(function* () {
-			const services = yield* store.listServices
-			yield* Effect.annotateCurrentSpan("trace.service_count", services.length)
-			return services
-		})()
-
-		const listRecentTraces = Effect.fn("motel/TraceQueryService.listRecentTraces")(function* (serviceName: string, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) {
-			yield* Effect.annotateCurrentSpan({
-				"trace.service_name": serviceName,
-			})
-			const traces = yield* store.listRecentTraces(serviceName, options)
-			yield* Effect.annotateCurrentSpan("trace.result_count", traces.length)
-			return traces
-		})
-
-		const listTraceSummaries = Effect.fn("motel/TraceQueryService.listTraceSummaries")(function* (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) {
-			yield* Effect.annotateCurrentSpan({
-				"trace.service_name": serviceName,
-			})
-			const traces = yield* store.listTraceSummaries(serviceName, options)
-			yield* Effect.annotateCurrentSpan("trace.result_count", traces.length)
-			return traces
-		})
-
-		const getTrace = Effect.fn("motel/TraceQueryService.getTrace")(function* (traceId: string) {
-			yield* Effect.annotateCurrentSpan("trace.trace_id", traceId)
-			return yield* store.getTrace(traceId)
-		})
-
-		const getSpan = Effect.fn("motel/TraceQueryService.getSpan")(function* (spanId: string) {
-			yield* Effect.annotateCurrentSpan("trace.span_id", spanId)
-			return yield* store.getSpan(spanId)
-		})
-
-		return TraceQueryService.of({
-			listServices,
-			listRecentTraces,
-			listTraceSummaries,
-			searchTraceSummaries: store.searchTraceSummaries,
-			listFacets: store.listFacets,
-			searchTraces: store.searchTraces,
-			traceStats: store.traceStats,
-			getTrace,
-			getSpan,
-			getAiCall: store.getAiCall,
-			listTraceSpans: store.listTraceSpans,
-			searchSpans: store.searchSpans,
-		})
-	}),
+	Effect.map(TelemetryStore.asEffect(), (store) => TraceQueryService.of({
+		listServices: store.listServices,
+		listRecentTraces: store.listRecentTraces,
+		listTraceSummaries: store.listTraceSummaries,
+		searchTraceSummaries: store.searchTraceSummaries,
+		listFacets: store.listFacets,
+		searchTraces: store.searchTraces,
+		traceStats: store.traceStats,
+		getTrace: store.getTrace,
+		getSpan: store.getSpan,
+		getAiCall: store.getAiCall,
+		listTraceSpans: store.listTraceSpans,
+		searchSpans: store.searchSpans,
+	})),
 )

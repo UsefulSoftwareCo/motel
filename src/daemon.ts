@@ -124,14 +124,12 @@ const workdirMatches = (targetWorkdir: string, daemonWorkdir: string) => {
 	return normalizedTarget === normalizedDaemon || normalizedTarget.startsWith(normalizedDaemon)
 }
 
-const pickByWorkdir = (entries: readonly RegistryEntry[], targetWorkdir: string) => {
-	const withSep = targetWorkdir.endsWith(path.sep) ? targetWorkdir : `${targetWorkdir}${path.sep}`
+const pickByUrl = (entries: readonly RegistryEntry[], baseUrl: string, databasePath: string) => {
 	return entries
 		.filter((entry) => {
-			const workdir = entry.workdir.endsWith(path.sep) ? entry.workdir : `${entry.workdir}${path.sep}`
-			return withSep === workdir || withSep.startsWith(workdir)
+			return entry.url === baseUrl && (entry.databasePath === undefined || entry.databasePath === databasePath)
 		})
-		.sort((a, b) => b.workdir.length - a.workdir.length)[0] ?? null
+		.sort((a, b) => Number(b.databasePath === databasePath) - Number(a.databasePath === databasePath))[0] ?? null
 }
 
 const expectedEnv = (config: DaemonConfig) => ({
@@ -147,7 +145,7 @@ const expectedEnv = (config: DaemonConfig) => ({
 export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager => {
 	const config = resolveConfig(options)
 	const mapError = (error: unknown) => new DaemonError(error instanceof Error ? error.message : String(error))
-	const readRegistryEntry = () => pickByWorkdir(listAliveEntries(), config.workdir)
+	const readRegistryEntry = () => pickByUrl(listAliveEntries(), config.baseUrl, config.databasePath)
 
 	const fetchHealth = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<HealthShape | null> => {
 		try {
@@ -205,9 +203,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		if (health.service !== MOTEL_SERVICE_ID) {
 			return `Port ${config.port} is in use by ${health.service}, not ${MOTEL_SERVICE_ID}.`
 		}
-		if (!workdirMatches(config.workdir, health.workdir)) {
-			return `Port ${config.port} is serving motel for ${health.workdir}, not ${config.workdir}.`
-		}
 		if (health.databasePath !== config.databasePath) {
 			return `Port ${config.port} is serving motel with ${health.databasePath}, expected ${config.databasePath}.`
 		}
@@ -226,9 +221,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	 * when absent we skip the DB check rather than refusing to adopt.
 	 */
 	const describeRegistryMismatch = (entry: RegistryEntry): string | null => {
-		if (!workdirMatches(config.workdir, entry.workdir)) {
-			return `Port ${config.port} is serving motel for ${entry.workdir}, not ${config.workdir}.`
-		}
 		if (entry.databasePath && entry.databasePath !== config.databasePath) {
 			return `Port ${config.port} is serving motel with ${entry.databasePath}, expected ${config.databasePath}.`
 		}
@@ -237,7 +229,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 
 	/**
 	 * Build a DaemonStatus from a live registry entry. Returns null when
-	 * there's no entry for our cwd, the registered pid isn't running, or
+	 * there's no entry for our URL/database, the registered pid isn't running, or
 	 * the entry is for a differently-configured daemon (different port).
 	 * This is the fast path: no HTTP, no event-loop round-trip, just a
 	 * directory read and a process.kill(pid, 0) liveness probe.
@@ -245,6 +237,10 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const getStatusFromRegistry = (): DaemonStatus | null => {
 		const entry = readRegistryEntry()
 		if (!entry) return null
+		// Old registry entries do not identify the database they serve.
+		// Validate those through /api/health rather than adopting a possibly
+		// project-local daemon as the new shared global instance.
+		if (entry.databasePath === undefined) return null
 		// Port discriminator: a motel registry shared across several
 		// daemons (e.g., user running two instances on different
 		// ports from the same workdir, or a test harness on a random
@@ -258,7 +254,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			service: MOTEL_SERVICE_ID,
 			pid: entry.pid,
 			url: entry.url,
-			databasePath: entry.databasePath ?? config.databasePath,
+			databasePath: entry.databasePath,
 			workdir: entry.workdir,
 			startedAt: entry.startedAt,
 			version: entry.version,
@@ -375,7 +371,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const getStatus = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<DaemonStatus> => {
 		// Fast path: trust the local filesystem registry. When a motel
 		// daemon started on this machine it wrote an entry for its pid
-		// + cwd + databasePath; if that entry is still there and the pid
+		// + URL + databasePath; if that entry is still there and the pid
 		// is alive, the daemon is almost certainly the one we want to
 		// adopt. HTTP health is skipped because the daemon's health
 		// endpoint can queue behind heavy OTLP ingest traffic, making
@@ -514,9 +510,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const stop = async (): Promise<DaemonStatus> => {
 		const status = await getStatus()
 		if (status.pid === null) return status
-		if (!status.sameWorkdir) {
-			throw new Error(`Refusing to stop motel owned by ${status.workdir}.`)
-		}
 		if (status.service !== null && status.service !== MOTEL_SERVICE_ID) {
 			throw new Error(`Refusing to stop non-motel service ${status.service} on ${status.url}.`)
 		}

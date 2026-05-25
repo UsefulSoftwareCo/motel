@@ -5,7 +5,7 @@ import { AlignedHeaderLine, Divider, FilterBar, PlainLine, TextLine } from "./pr
 import { WaterfallTimeline } from "./Waterfall.tsx"
 import { computeMatchingSpanIds } from "./waterfallFilter.ts"
 import { getVisibleSpans } from "./waterfallModel.ts"
-import type { LoadStatus } from "./state.ts"
+import type { LoadStatus } from "./atoms.ts"
 import { colors, SEPARATOR } from "./theme.ts"
 
 /**

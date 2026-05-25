@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef } from "react"
 import type { LogItem } from "../domain.ts"
 import { fitCell, formatLogTimestamp, formatTimestamp, logHeadline, logSeverityColor, relevantLogAttributes, truncateText, wrapTextLines } from "./format.ts"
 import { Divider, PlainLine, TextLine } from "./primitives.tsx"
-import type { ServiceLogState } from "./state.ts"
+import type { ServiceLogState } from "./atoms.ts"
 import { colors, SEPARATOR } from "./theme.ts"
 
 export const ServiceLogsView = ({

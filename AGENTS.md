@@ -94,11 +94,10 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `src/runtime.ts` wires the Effect beta runtime and OTEL trace + log exporters.
 - `src/localServer.ts` starts the local Bun OTLP/query server.
 - `src/httpApi.ts` defines the typed Effect HttpApi surface and OpenAPI spec for the local server.
+- `src/httpListPolicy.ts` owns pure HTTP list/search parameter decoding, bounds, cursors, and pagination metadata shaping.
 - `src/server.ts` runs the local server without the TUI.
 - `src/instructions.ts` contains the copied setup instructions for other Effect apps.
-- `src/services/TelemetryStore.ts` persists traces and logs in SQLite and exposes indexed queries.
-- `src/services/TraceQueryService.ts` reads traces from the local store.
-- `src/services/LogQueryService.ts` reads logs from the local store.
+- `src/services/TelemetryStore.ts` persists traces and logs in SQLite and exposes indexed queries through writer and read-only service identifiers.
 - `src/config.ts` is the source of truth for ports and env-driven OTEL settings.
 - `web/` is a Vite + React SPA for the browser-based UI (Tailwind CSS, `@effect/atom-react`, `AtomHttpApi`).
 - `web/src/api.ts` creates the typed `AtomHttpApi.Service` client from `src/httpApi.ts`.

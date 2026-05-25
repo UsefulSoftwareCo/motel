@@ -62,8 +62,9 @@ http://127.0.0.1:27686/v1/traces
 http://127.0.0.1:27686/v1/logs
 ```
 
-Motel keeps everything in a local SQLite database at
-`.motel-data/telemetry.sqlite`. No Docker, no cloud account.
+Motel keeps everything in a machine-global local SQLite database at
+`${XDG_STATE_HOME:-~/.local/state}/motel/telemetry.sqlite`. One managed
+daemon is shared across local projects. No Docker, no cloud account.
 
 ## How agents connect
 

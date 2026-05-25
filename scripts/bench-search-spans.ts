@@ -107,12 +107,11 @@ const loadRuntime = async (dbPath: string) => {
 	const suffix = `?bench=${Date.now()}-${Math.random().toString(36).slice(2)}`
 	const runtime = await import(`../src/runtime.ts${suffix}`)
 	const storeModule = await import(`../src/services/TelemetryStore.ts${suffix}`)
-	const traceModule = await import(`../src/services/TraceQueryService.ts${suffix}`)
 	return {
 		storeRuntime: runtime.storeRuntime,
 		queryRuntime: runtime.queryRuntime,
 		TelemetryStore: storeModule.TelemetryStore,
-		TraceQueryService: traceModule.TraceQueryService,
+		TelemetryStoreReadonly: storeModule.TelemetryStoreReadonly,
 	}
 }
 
@@ -135,7 +134,7 @@ const seedStore = async (
 const runOne = async (loaded: LoadedRuntime): Promise<Sample> => {
 	const startedAt = performance.now()
 	const result = await loaded.queryRuntime.runPromise(
-		Effect.flatMap(loaded.TraceQueryService.asEffect(), (store) =>
+		Effect.flatMap(loaded.TelemetryStoreReadonly.asEffect(), (store) =>
 			store.searchSpans({
 				serviceName: "bench-api",
 				operation: "search.target",

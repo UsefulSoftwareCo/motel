@@ -2,7 +2,7 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { BlankRow, TextLine } from "./primitives.tsx"
 import { colors } from "./theme.ts"
 import { fitCell, truncateText } from "./format.ts"
-import type { AttrFacetState, AttrPickerMode } from "./state.ts"
+import type { AttrFacetState, AttrPickerMode } from "./atoms.ts"
 
 export interface AttrFilterModalProps {
 	readonly width: number

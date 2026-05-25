@@ -3,13 +3,15 @@ import { useEffect } from "react"
 import {
 	attrFacetStateAtom,
 	attrPickerModeAtom,
-	ensureTraceAttributeKeys,
-	ensureTraceAttributeValues,
-	getCachedFacetKeys,
-	getCachedFacetValues,
 	initialAttrFacetState,
 	selectedTraceServiceAtom,
-} from "./state.ts"
+} from "./atoms.ts"
+import {
+	getCachedFacetKeys,
+	getCachedFacetValues,
+	refreshTraceAttributeKeys,
+	refreshTraceAttributeValues,
+} from "./loaders.ts"
 
 // Drive the picker's data state from (pickerMode, service, selectedKey).
 //
@@ -17,7 +19,7 @@ import {
 // module-level cache has instantly (no "loading…" flash), then kick off a
 // background revalidation. The first time we see a (service, key) tuple
 // we still show `loading` so the UI has something to say. The module-level
-// caches in `state.ts` mean a service-change pre-warm can fill the cache
+// caches in `loaders.ts` mean a service-change pre-warm can fill the cache
 // before the user ever presses `f`.
 export const useAttrFilterPicker = (selectedKey: string | null) => {
 	const [pickerMode] = useAtom(attrPickerModeAtom)
@@ -52,7 +54,7 @@ export const useAttrFilterPicker = (selectedKey: string | null) => {
 			} else {
 				publishLoading(null)
 			}
-			ensureTraceAttributeKeys(service)
+			refreshTraceAttributeKeys(service)
 				.then((entry) => {
 					if (cancelled) return
 					publishReady(null, entry.data)
@@ -68,7 +70,7 @@ export const useAttrFilterPicker = (selectedKey: string | null) => {
 			} else {
 				publishLoading(selectedKey)
 			}
-			ensureTraceAttributeValues(service, selectedKey)
+			refreshTraceAttributeValues(service, selectedKey)
 				.then((entry) => {
 					if (cancelled) return
 					publishReady(selectedKey, entry.data)

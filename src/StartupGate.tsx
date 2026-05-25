@@ -13,7 +13,6 @@ type ConflictStatus = DaemonStatus & {
 	readonly pid: number
 	readonly workdir: string
 	readonly reason: string
-	readonly sameWorkdir: false
 }
 
 type ConflictScreenState = {
@@ -61,8 +60,7 @@ const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictS
 	status.service === MOTEL_SERVICE_ID &&
 	status.pid !== null &&
 	status.workdir !== null &&
-	status.reason !== null &&
-	!status.sameWorkdir
+	status.reason !== null
 
 const stopConflictingDaemon = async (status: ConflictStatus) => {
 	const port = parsePort(status.url)
@@ -151,7 +149,7 @@ const RecoveryScreen = ({
 				</box>
 				<box paddingTop={1} flexDirection="column">
 					{notice ? <PlainLine text={notice} fg={busy ? colors.warning : colors.count} /> : null}
-					<PlainLine text={busy ? "Working..." : "j/k or ↑↓ select · enter run · r retry · k kill conflicting daemon · q quit"} fg={colors.count} />
+					<PlainLine text={busy ? "Working..." : "j/k or ↑↓ select · enter run · r retry · k stop incompatible daemon · q quit"} fg={colors.count} />
 				</box>
 			</box>
 		</box>
@@ -192,7 +190,7 @@ export const StartupGate = () => {
 				{ key: "r", label: "Retry startup", run: attemptStart },
 				{
 					key: "k",
-					label: `Stop conflicting daemon (${startupState.status.pid})`,
+					label: `Stop incompatible daemon (${startupState.status.pid})`,
 					run: async () => {
 						setStartupState((current) => current.kind === "conflict"
 							? { ...current, busy: true, notice: `Stopping daemon ${current.status.pid}...` }
@@ -253,16 +251,16 @@ export const StartupGate = () => {
 		const status = startupState.status
 		const detailLines = [
 			`Port: ${status.url}`,
-			`Conflicting workdir: ${status.workdir}`,
-			`Conflicting pid: ${status.pid}`,
-			`Database: ${status.databasePath}`,
+			`Daemon workdir: ${status.workdir}`,
+			`Daemon pid: ${status.pid}`,
+			`Incompatible database: ${status.databasePath}`,
 			status.workdir.startsWith("/tmp") || status.workdir.startsWith("/private/tmp")
 				? "This looks like a temp/test daemon."
-				: "This looks like a real motel daemon started from another project.",
+				: "This daemon is using a different database configuration.",
 		]
 		return (
 			<RecoveryScreen
-				title="Daemon Conflict"
+				title="Daemon Configuration Conflict"
 				message={startupState.message}
 				width={width}
 				height={height}

@@ -181,6 +181,43 @@ describe("daemon manager", () => {
 		}
 	})
 
+	test("validates legacy registry entries before adopting a shared daemon", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		const stateRoot = path.join(harness.runtimeDir, "legacy-state")
+		const originalXdg = process.env.XDG_STATE_HOME
+		process.env.XDG_STATE_HOME = stateRoot
+		const instancesDir = path.join(stateRoot, "motel", "instances")
+		fs.mkdirSync(instancesDir, { recursive: true })
+		const entryPath = path.join(instancesDir, `${process.pid}.json`)
+		fs.writeFileSync(entryPath, JSON.stringify({
+			pid: process.pid,
+			url: `http://127.0.0.1:${harness.port}`,
+			workdir: "/tmp/legacy-project",
+			startedAt: new Date().toISOString(),
+			version: "0.0.0-legacy",
+		}), "utf8")
+
+		const fake = startFakeDaemon({
+			port: harness.port,
+			databasePath: path.join(harness.runtimeDir, "legacy.sqlite"),
+			delayMs: 0,
+		})
+
+		try {
+			const status = await Effect.runPromise(harness.manager.getStatus)
+			expect(status.running).toBe(false)
+			expect(status.managed).toBe(false)
+			expect(status.reason).toContain("expected")
+			expect(status.databasePath).toBe(path.join(harness.runtimeDir, "legacy.sqlite"))
+		} finally {
+			fake.stop()
+			fs.rmSync(entryPath, { force: true })
+			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME
+			else process.env.XDG_STATE_HOME = originalXdg
+		}
+	})
+
 	test("starts once, reuses the same daemon, and stops cleanly", async () => {
 		const harness = makeHarness()
 		activeHarnesses.push(harness)
@@ -230,18 +267,20 @@ describe("daemon manager", () => {
 
 	test("uses the shared global state dir regardless of caller cwd", async () => {
 		const projectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-project-")))
+		const otherProjectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-other-project-")))
 		const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-state-"))
 		const expectedRuntimeDir = path.join(stateRoot, "motel")
 		const expectedDatabasePath = path.join(expectedRuntimeDir, "telemetry.sqlite")
 		const originalXdg = process.env.XDG_STATE_HOME
 		process.env.XDG_STATE_HOME = stateRoot
 		let manager: ReturnType<typeof createDaemonManager> | null = null
+		const port = randomPort()
 
 		try {
 			await withCwd(projectDir, async () => {
 				manager = createDaemonManager({
 					repoRoot,
-					port: randomPort(),
+					port,
 				})
 
 				const started = await Effect.runPromise(manager.ensure)
@@ -256,7 +295,23 @@ describe("daemon manager", () => {
 				const reused = await Effect.runPromise(manager.ensure)
 				expect(reused.pid).toBe(started.pid)
 
-				const stopped = await Effect.runPromise(manager.stop)
+				await withCwd(otherProjectDir, async () => {
+					const otherManager = createDaemonManager({
+						repoRoot,
+						port,
+					})
+					const adopted = await Effect.runPromise(otherManager.ensure)
+					expect(adopted.running).toBe(true)
+					expect(adopted.managed).toBe(true)
+					expect(adopted.pid).toBe(started.pid)
+					expect(adopted.workdir).toBe(projectDir)
+					expect(adopted.sameWorkdir).toBe(false)
+					expect(adopted.reason).toBe(null)
+					const stopped = await Effect.runPromise(otherManager.stop)
+					expect(stopped.running).toBe(false)
+				})
+
+				const stopped = await Effect.runPromise(manager.getStatus)
 				expect(stopped.running).toBe(false)
 			})
 		} finally {
@@ -266,6 +321,7 @@ describe("daemon manager", () => {
 				}
 			})
 			fs.rmSync(projectDir, { recursive: true, force: true })
+			fs.rmSync(otherProjectDir, { recursive: true, force: true })
 			fs.rmSync(stateRoot, { recursive: true, force: true })
 			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME
 			else process.env.XDG_STATE_HOME = originalXdg

@@ -60,12 +60,13 @@ const press = async (...keys: string[]) => {
 // *last* pair makes the helper robust to layout changes that add or remove
 // header dividers (breadcrumbs, split-divider junctions, etc.).
 //
-// In wide (side-by-side) mode each line also contains the trace list on the
-// left half separated by `│`. The list renders relative ages like "6s / 7s"
-// that drift between snapshots; strip everything left of the first `│` so
-// only the waterfall contributes to the comparison.
+// In wide level-1 mode the waterfall is rendered in the left pane and span
+// detail is rendered on the right. Determine the pane separator from the
+// stable header line rather than mistaking tree branch glyphs for it.
 const waterfallBody = (snap: string): readonly string[] => {
 	const lines = snap.split("\n")
+	const header = lines.find((line) => line.includes("TRACE DETAILS") && line.includes("SPAN"))
+	const paneSeparator = header?.indexOf("\u2502") ?? -1
 	const dividerIdxs: number[] = []
 	for (let i = 0; i < lines.length; i++) {
 		if (lines[i]!.startsWith("─")) dividerIdxs.push(i)
@@ -74,8 +75,7 @@ const waterfallBody = (snap: string): readonly string[] => {
 	const start = dividerIdxs[dividerIdxs.length - 2]! + 1
 	const end = dividerIdxs[dividerIdxs.length - 1]!
 	return lines.slice(start, end).map((line) => {
-		const barIdx = line.indexOf("\u2502")
-		const sliced = barIdx >= 0 ? line.slice(barIdx) : line
+		const sliced = paneSeparator >= 0 ? line.slice(0, paneSeparator) : line
 		return sliced.replace(/\s+$/g, "")
 	})
 }
@@ -141,8 +141,7 @@ describe("waterfall collapse/expand (end-to-end TUI)", () => {
 		// Make sure no stale session is hanging around with the same name.
 		await tui(["close", "--session", SESSION])
 
-		// Launch the TUI. We use a dedicated entry point (src/index.tsx) and a
-		// generous viewport so the waterfall isn't truncated.
+		// Launch wide enough to exercise the waterfall + span-detail split.
 		const launch = await tui([
 			"launch",
 			"bun run src/index.tsx",

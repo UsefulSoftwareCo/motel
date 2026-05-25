@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState } from "react"
 import type { TraceSummaryItem } from "../domain.ts"
 import { fitCell, formatDuration, lifecycleLabel, relativeTime, traceIndicator, traceIndicatorColor, traceRowId } from "./format.ts"
 import { BlankRow, PlainLine, TextLine } from "./primitives.tsx"
-import type { LoadStatus } from "./state.ts"
+import type { LoadStatus } from "./atoms.ts"
 import { colors } from "./theme.ts"
 
 const getTraceRowLayout = (contentWidth: number) => {

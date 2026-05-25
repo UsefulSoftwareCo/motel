@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
+import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
 import { dirname } from "node:path"
-import { Clock, Effect, Layer, Schedule, Context } from "effect"
+import { Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
@@ -196,25 +196,49 @@ const TRACE_SUMMARY_SELECT_SQL = `
 	FROM spans
 `
 
+// Memoize small repeated JSON records. Resource attributes are the primary
+// beneficiary because many spans share the same serialized value; compact
+// repeated span attributes also benefit while large unique payloads bypass
+// the cache to keep memory bounded for long-running daemons.
+const RECORD_PARSE_CACHE_MAX_VALUE_LEN = 1024
+const RECORD_PARSE_CACHE_LIMIT = 256
+const recordParseCache = new Map<string, Record<string, string>>()
+const EMPTY_RECORD: Record<string, string> = {}
+
 const parseRecord = (value: string): Record<string, string> => {
-	try {
-		const parsed = JSON.parse(value) as Record<string, unknown>
-		return Object.fromEntries(Object.entries(parsed).map(([key, entry]) => [key, stringifyValue(entry)]))
-	} catch {
-		return {}
+	if (value === "" || value === "{}") return EMPTY_RECORD
+	const cacheable = value.length <= RECORD_PARSE_CACHE_MAX_VALUE_LEN
+	if (cacheable) {
+		const cached = recordParseCache.get(value)
+		if (cached !== undefined) return cached
 	}
+	let parsed: Record<string, string>
+	try {
+		const json = JSON.parse(value) as Record<string, unknown>
+		parsed = Object.fromEntries(Object.entries(json).map(([key, entry]) => [key, stringifyValue(entry)]))
+	} catch {
+		parsed = EMPTY_RECORD
+	}
+	if (cacheable && recordParseCache.size < RECORD_PARSE_CACHE_LIMIT) {
+		recordParseCache.set(value, parsed)
+	}
+	return parsed
 }
 
+const EMPTY_EVENTS: readonly TraceSpanEvent[] = []
+
 const parseEvents = (value: string): readonly TraceSpanEvent[] => {
+	if (value === "" || value === "[]") return EMPTY_EVENTS
 	try {
 		const parsed = JSON.parse(value) as Array<{ name: string; timestamp: number; attributes: Record<string, string> }>
+		if (parsed.length === 0) return EMPTY_EVENTS
 		return parsed.map((event) => ({
 			name: event.name,
 			timestamp: new Date(event.timestamp),
 			attributes: event.attributes,
 		}))
 	} catch {
-		return []
+		return EMPTY_EVENTS
 	}
 }
 
@@ -423,29 +447,40 @@ const buildContainsAttributeMatchSubquery = (
 	}
 }
 
+// Read-only surface of the telemetry store. Pulled out so a readonly
+// SQLite connection (TUI / HTTP query handlers) can be expressed as a
+// distinct service identifier from the writer, without re-declaring
+// every query in a wrapper layer. The writer's value still satisfies
+// this shape — TelemetryStoreLive can provide both identifiers from
+// one underlying object if needed.
+export interface TelemetryStoreReader {
+	readonly listServices: Effect.Effect<readonly string[], Error>
+	readonly listRecentTraces: (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) => Effect.Effect<readonly TraceItem[], Error>
+	readonly listTraceSummaries: (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) => Effect.Effect<readonly TraceSummaryItem[], Error>
+	readonly searchTraces: (input: TraceSearch) => Effect.Effect<readonly TraceItem[], Error>
+	readonly searchTraceSummaries: (input: TraceSearch) => Effect.Effect<readonly TraceSummaryItem[], Error>
+	readonly traceStats: (input: TraceStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
+	readonly getTrace: (traceId: string) => Effect.Effect<TraceItem | null, Error>
+	readonly getSpan: (spanId: string) => Effect.Effect<SpanItem | null, Error>
+	readonly listTraceSpans: (traceId: string) => Effect.Effect<readonly SpanItem[], Error>
+	readonly searchSpans: (input: SpanSearch) => Effect.Effect<readonly SpanItem[], Error>
+	readonly searchLogs: (input: LogSearch) => Effect.Effect<readonly LogItem[], Error>
+	readonly logStats: (input: LogStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
+	readonly listFacets: (input: FacetSearch) => Effect.Effect<readonly FacetItem[], Error>
+	readonly listRecentLogs: (serviceName: string) => Effect.Effect<readonly LogItem[], Error>
+	readonly listTraceLogs: (traceId: string) => Effect.Effect<readonly LogItem[], Error>
+	readonly searchAiCalls: (input: AiCallSearch) => Effect.Effect<readonly AiCallSummary[], Error>
+	readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
+	readonly aiCallStats: (input: AiCallStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
+}
+
+export class TelemetryStoreReadonly extends Context.Service<TelemetryStoreReadonly, TelemetryStoreReader>()("motel/TelemetryStoreReadonly") {}
+
 export class TelemetryStore extends Context.Service<
 	TelemetryStore,
-	{
+	TelemetryStoreReader & {
 		readonly ingestTraces: (payload: OtlpTraceExportRequest) => Effect.Effect<{ readonly insertedSpans: number }, Error>
 		readonly ingestLogs: (payload: OtlpLogExportRequest) => Effect.Effect<{ readonly insertedLogs: number }, Error>
-		readonly listServices: Effect.Effect<readonly string[], Error>
-		readonly listRecentTraces: (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) => Effect.Effect<readonly TraceItem[], Error>
-		readonly listTraceSummaries: (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) => Effect.Effect<readonly TraceSummaryItem[], Error>
-		readonly searchTraces: (input: TraceSearch) => Effect.Effect<readonly TraceItem[], Error>
-		readonly searchTraceSummaries: (input: TraceSearch) => Effect.Effect<readonly TraceSummaryItem[], Error>
-		readonly traceStats: (input: TraceStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
-		readonly getTrace: (traceId: string) => Effect.Effect<TraceItem | null, Error>
-		readonly getSpan: (spanId: string) => Effect.Effect<SpanItem | null, Error>
-		readonly listTraceSpans: (traceId: string) => Effect.Effect<readonly SpanItem[], Error>
-		readonly searchSpans: (input: SpanSearch) => Effect.Effect<readonly SpanItem[], Error>
-		readonly searchLogs: (input: LogSearch) => Effect.Effect<readonly LogItem[], Error>
-		readonly logStats: (input: LogStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
-		readonly listFacets: (input: FacetSearch) => Effect.Effect<readonly FacetItem[], Error>
-		readonly listRecentLogs: (serviceName: string) => Effect.Effect<readonly LogItem[], Error>
-		readonly listTraceLogs: (traceId: string) => Effect.Effect<readonly LogItem[], Error>
-		readonly searchAiCalls: (input: AiCallSearch) => Effect.Effect<readonly AiCallSummary[], Error>
-		readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
-		readonly aiCallStats: (input: AiCallStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
 	}
 >()("motel/TelemetryStore") {}
 
@@ -470,10 +505,10 @@ export interface TelemetryStoreOptions {
 	readonly runRetention: boolean
 }
 
-export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.effect(
-	TelemetryStore,
+const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 	Effect.gen(function* () {
-		mkdirSync(dirname(config.otel.databasePath), { recursive: true })
+		const fileSystem = yield* FileSystem.FileSystem
+		yield* fileSystem.makeDirectory(dirname(config.otel.databasePath), { recursive: true })
 		const db = yield* Effect.acquireRelease(
 			Effect.sync(() => new Database(config.otel.databasePath, {
 				create: !opts.readonly,
@@ -1237,9 +1272,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const listServices = Effect.fn("motel/TelemetryStore.listServices")(function* () {
-
 			const cutoff = (yield* Clock.currentTimeMillis) - config.otel.traceLookbackMinutes * 60 * 1000
-			return yield* Effect.sync(() => {
+			const services = yield* Effect.sync(() => {
+				// Discover recent activity from span rows, not trace starts: a
+				// long-running trace can emit a current child after its root ages
+				// outside the lookback window.
 				const rows = db.query(`
 					SELECT service_name FROM spans WHERE start_time_ms >= ?
 					UNION
@@ -1248,6 +1285,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				`).all(cutoff, cutoff) as Array<{ service_name: string }>
 				return rows.map((row) => row.service_name)
 			})
+			yield* Effect.annotateCurrentSpan("trace.service_count", services.length)
+			return services
 		})()
 
 		const loadTracesByIds = (traceIds: readonly string[]) => {
@@ -1273,15 +1312,19 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		}
 
 		const listRecentTraces = Effect.fn("motel/TelemetryStore.listRecentTraces")(function* (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number }) {
+			yield* Effect.annotateCurrentSpan("trace.service_name", serviceName ?? "all")
 			const summaries = yield* listTraceSummaries(serviceName, options)
-			return yield* Effect.sync(() => loadTracesByIds(summaries.map((summary) => summary.traceId)))
+			const traces = yield* Effect.sync(() => loadTracesByIds(summaries.map((summary) => summary.traceId)))
+			yield* Effect.annotateCurrentSpan("trace.result_count", traces.length)
+			return traces
 		})
 
 		const listTraceSummaries = Effect.fn("motel/TelemetryStore.listTraceSummaries")(function* (serviceName: string | null, options?: { readonly lookbackMinutes?: number; readonly limit?: number; readonly cursorStartedAtMs?: number; readonly cursorTraceId?: string }) {
+			yield* Effect.annotateCurrentSpan("trace.service_name", serviceName ?? "all")
 			const cutoff = (yield* Clock.currentTimeMillis) - (options?.lookbackMinutes ?? config.otel.traceLookbackMinutes) * 60 * 1000
 			const limit = options?.limit ?? config.otel.traceFetchLimit
 
-			return yield* Effect.sync(() => {
+			const summaries = yield* Effect.sync(() => {
 				const clauses = ["started_at_ms >= ?"]
 				const params: Array<string | number> = [cutoff]
 
@@ -1303,6 +1346,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					LIMIT ?
 				`).all(...params, limit) as TraceSummaryRow[]
 			}).pipe(Effect.map((rows) => rows.map(parseSummaryRow)))
+			yield* Effect.annotateCurrentSpan("trace.result_count", summaries.length)
+			return summaries
 		})
 
 		const searchTraceSummaries = Effect.fn("motel/TelemetryStore.searchTraceSummaries")(function* (input: TraceSearch) {
@@ -1381,6 +1426,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const getTrace = Effect.fn("motel/TelemetryStore.getTrace")(function* (traceId: string) {
+			yield* Effect.annotateCurrentSpan("trace.trace_id", traceId)
 			return yield* Effect.sync(() => {
 				const rows = db.query(`
 					SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time_ms ASC
@@ -1390,6 +1436,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const getSpan = Effect.fn("motel/TelemetryStore.getSpan")(function* (spanId: string) {
+			yield* Effect.annotateCurrentSpan("trace.span_id", spanId)
 			return yield* Effect.sync(() => {
 				// Fetch only the target span row (uses idx_spans_span_id)
 				const spanRow = db.query(`SELECT * FROM spans WHERE span_id = ? LIMIT 1`).get(spanId) as SpanRow | null
@@ -1397,35 +1444,34 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 				const traceId = spanRow.trace_id
 
-				// Get root operation name (indexed by trace_id)
+				// Walk the parent chain in one recursive CTE instead of one query
+				// per hop. Root context remains the earliest root in the trace,
+				// matching full trace hydration even when input has multiple roots.
+				let parentOperationName: string | null = null
+				let depth = 0
+				if (spanRow.parent_span_id) {
+					const ancestors = db.query(`
+						WITH RECURSIVE ancestors(span_id, parent_span_id, operation_name, hop) AS (
+							SELECT span_id, parent_span_id, operation_name, 1
+							FROM spans WHERE trace_id = ? AND span_id = ?
+							UNION ALL
+							SELECT s.span_id, s.parent_span_id, s.operation_name, a.hop + 1
+							FROM ancestors a
+							JOIN spans s ON s.trace_id = ? AND s.span_id = a.parent_span_id
+						)
+						SELECT span_id, parent_span_id, operation_name, hop FROM ancestors ORDER BY hop ASC
+					`).all(traceId, spanRow.parent_span_id, traceId) as Array<{ span_id: string; parent_span_id: string | null; operation_name: string; hop: number }>
+
+					parentOperationName = ancestors[0]?.operation_name ?? null
+					depth = ancestors.length
+				}
+
 				const rootRow = db.query(`
 					SELECT operation_name FROM spans
 					WHERE trace_id = ? AND parent_span_id IS NULL
 					ORDER BY start_time_ms ASC LIMIT 1
 				`).get(traceId) as { operation_name: string } | null
 				const rootOperationName = rootRow?.operation_name ?? "unknown"
-
-				// Get parent operation name if span has a parent (PK lookup)
-				let parentOperationName: string | null = null
-				if (spanRow.parent_span_id) {
-					const parentRow = db.query(`
-						SELECT operation_name FROM spans
-						WHERE trace_id = ? AND span_id = ?
-					`).get(traceId, spanRow.parent_span_id) as { operation_name: string } | null
-					parentOperationName = parentRow?.operation_name ?? null
-				}
-
-				// Compute depth by walking up parent chain (typically 3-5 hops)
-				let depth = 0
-				let currentParentId = spanRow.parent_span_id
-				while (currentParentId) {
-					const parentRow = db.query(`
-						SELECT parent_span_id FROM spans WHERE trace_id = ? AND span_id = ?
-					`).get(traceId, currentParentId) as { parent_span_id: string | null } | null
-					if (!parentRow) break
-					depth++
-					currentParentId = parentRow.parent_span_id
-				}
 
 				const parsed = parseSpanRow(spanRow)
 				return {
@@ -1448,9 +1494,22 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			const cutoff = (yield* Clock.currentTimeMillis) - (input.lookbackMinutes ?? config.otel.traceLookbackMinutes) * 60 * 1000
 			const limit = input.limit ?? 100
 			const hasContainsFilters = Object.keys(input.attributeContainsFilters ?? {}).length > 0
-			const candidateLimit = hasContainsFilters ? Math.max(limit * 20, 500) : Math.max(limit * 10, 200)
+			// Only over-fetch when post-filtering will discard rows. Without
+			// a parentOperation filter the SQL `LIMIT` already returns the
+			// final set, and over-fetching just makes us parse JSON blobs
+			// for rows we'll throw away.
+			const needsPostFilter = !!input.parentOperation
+			const candidateLimit = !needsPostFilter
+				? limit
+				: hasContainsFilters
+					? Math.max(limit * 20, 500)
+					: Math.max(limit * 10, 200)
 
 			return yield* Effect.sync(() => {
+				// First pass: fetch only the columns needed to filter and
+				// to drive the parent-context lookup. Parsing the heavy
+				// `*_json` blobs is deferred until after we've sliced down
+				// to the final `limit`.
 				let fromSql = "FROM spans AS s"
 				const joinParams: Array<string | number> = []
 				const clauses: string[] = ["s.start_time_ms >= ?"]
@@ -1491,59 +1550,46 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					params.push(...containsAttrMatch.params)
 				}
 
-				const rows = db.query(`
-					SELECT *
+				const candidateRows = db.query(`
+					SELECT s.trace_id, s.span_id, s.parent_span_id, s.operation_name, s.start_time_ms
 					${fromSql}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY s.start_time_ms DESC
 					LIMIT ?
-				`).all(...joinParams, ...params, candidateLimit) as SpanRow[]
+				`).all(...joinParams, ...params, candidateLimit) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number }>
 
-				const traceIds = [...new Set(rows.map((row) => row.trace_id))]
+				const traceIds = [...new Set(candidateRows.map((row) => row.trace_id))]
 				if (traceIds.length === 0) return [] as readonly SpanItem[]
 
 				const keyOf = (traceId: string, spanId: string) => `${traceId}:${spanId}`
 				const spanContextById = new Map<string, { readonly parentSpanId: string | null; readonly operationName: string }>()
-				for (const row of rows) {
+
+				// Bulk-prefetch parent metadata for every span in every trace
+				// touched by the candidate set. One indexed scan per trace_id
+				// is much cheaper than a per-span lookup loop while computing
+				// depth, and we get the trace-root lookup in the same pass.
+				const placeholders = traceIds.map(() => "?").join(", ")
+				const allSpanRows = db.query(`
+					SELECT trace_id, span_id, parent_span_id, operation_name, start_time_ms
+					FROM spans
+					WHERE trace_id IN (${placeholders})
+				`).all(...traceIds) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number }>
+
+				const rootOperationByTraceId = new Map<string, { operationName: string; startTimeMs: number }>()
+				for (const row of allSpanRows) {
 					spanContextById.set(keyOf(row.trace_id, row.span_id), {
 						parentSpanId: row.parent_span_id,
 						operationName: row.operation_name,
 					})
-				}
-
-				const placeholders = traceIds.map(() => "?").join(", ")
-				const rootRows = db.query(`
-					SELECT trace_id, operation_name
-					FROM spans
-					WHERE trace_id IN (${placeholders}) AND parent_span_id IS NULL
-					ORDER BY start_time_ms ASC
-				`).all(...traceIds) as Array<{ trace_id: string; operation_name: string }>
-				const rootOperationByTraceId = new Map<string, string>()
-				for (const row of rootRows) {
-					if (!rootOperationByTraceId.has(row.trace_id)) {
-						rootOperationByTraceId.set(row.trace_id, row.operation_name)
+					if (row.parent_span_id === null) {
+						const existing = rootOperationByTraceId.get(row.trace_id)
+						if (!existing || row.start_time_ms < existing.startTimeMs) {
+							rootOperationByTraceId.set(row.trace_id, { operationName: row.operation_name, startTimeMs: row.start_time_ms })
+						}
 					}
 				}
 
-				const spanContextLookup = db.query(`
-					SELECT parent_span_id, operation_name
-					FROM spans
-					WHERE trace_id = ? AND span_id = ?
-				`)
-
-				const getSpanContext = (traceId: string, spanId: string) => {
-					const key = keyOf(traceId, spanId)
-					const cached = spanContextById.get(key)
-					if (cached !== undefined) return cached
-					const row = spanContextLookup.get(traceId, spanId) as { parent_span_id: string | null; operation_name: string } | null
-					if (!row) return null
-					const value = {
-						parentSpanId: row.parent_span_id,
-						operationName: row.operation_name,
-					}
-					spanContextById.set(key, value)
-					return value
-				}
+				const getSpanContext = (traceId: string, spanId: string) => spanContextById.get(keyOf(traceId, spanId)) ?? null
 
 				const depthById = new Map<string, number>()
 				const getDepth = (traceId: string, spanId: string, visiting = new Set<string>()): number => {
@@ -1558,32 +1604,57 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					return depth
 				}
 
-				return rows
-					.map((row) => {
-						const parentContext = row.parent_span_id ? getSpanContext(row.trace_id, row.parent_span_id) : null
-						const parsedSpan = parseSpanRow(row)
-						const span = {
-							...parsedSpan,
-							depth: getDepth(row.trace_id, row.span_id),
-							warnings: row.parent_span_id && !parentContext
-								? [`missing span ${row.parent_span_id} (1 child)`]
-								: parsedSpan.warnings,
-						}
-						return {
-							traceId: row.trace_id,
-							rootOperationName: rootOperationByTraceId.get(row.trace_id) ?? span.operationName,
-							parentOperationName: parentContext?.operationName ?? null,
-							span,
-						} satisfies SpanItem
+				// Apply parentOperation post-filter on the lite candidate set
+				// (cheap — string compare against cached parent op) and then
+				// slice down to the final result size before parsing any JSON.
+				const parentOperationNeedle = input.parentOperation?.toLowerCase() ?? null
+				const filteredLite: typeof candidateRows = []
+				for (const row of candidateRows) {
+					if (parentOperationNeedle) {
+						const parent = row.parent_span_id ? getSpanContext(row.trace_id, row.parent_span_id) : null
+						if (!parent?.operationName.toLowerCase().includes(parentOperationNeedle)) continue
+					}
+					filteredLite.push(row)
+					if (filteredLite.length >= limit) break
+				}
+
+				if (filteredLite.length === 0) return [] as readonly SpanItem[]
+
+				// Hydrate only the kept rows: one batched fetch of the full
+				// SpanRow (with resource_json / attributes_json / events_json)
+				// using SQLite's row-value `IN` syntax, then parseSpanRow per
+				// kept row. Result order follows `filteredLite` so the caller
+				// sees the same ordering the candidate scan produced.
+				const keptValues = filteredLite.map(() => "(?, ?)").join(", ")
+				const fullRows = db.query(`
+					SELECT * FROM spans WHERE (trace_id, span_id) IN (VALUES ${keptValues})
+				`).all(...filteredLite.flatMap((row) => [row.trace_id, row.span_id])) as SpanRow[]
+				const fullRowByKey = new Map<string, SpanRow>()
+				for (const row of fullRows) {
+					fullRowByKey.set(keyOf(row.trace_id, row.span_id), row)
+				}
+
+				const items: SpanItem[] = []
+				for (const lite of filteredLite) {
+					const row = fullRowByKey.get(keyOf(lite.trace_id, lite.span_id))
+					if (!row) continue
+					const parentContext = row.parent_span_id ? getSpanContext(row.trace_id, row.parent_span_id) : null
+					const parsedSpan = parseSpanRow(row)
+					const span = {
+						...parsedSpan,
+						depth: getDepth(row.trace_id, row.span_id),
+						warnings: row.parent_span_id && !parentContext
+							? [`missing span ${row.parent_span_id} (1 child)`]
+							: parsedSpan.warnings,
+					}
+					items.push({
+						traceId: row.trace_id,
+						rootOperationName: rootOperationByTraceId.get(row.trace_id)?.operationName ?? span.operationName,
+						parentOperationName: parentContext?.operationName ?? null,
+						span,
 					})
-					.filter((item) => {
-						if (input.parentOperation) {
-							const needle = input.parentOperation.toLowerCase()
-							if (!item.parentOperationName?.toLowerCase().includes(needle)) return false
-						}
-						return true
-					})
-					.slice(0, limit)
+				}
+				return items
 			})
 		})
 
@@ -1881,7 +1952,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const listRecentLogs = Effect.fn("motel/TelemetryStore.listRecentLogs")(function* (serviceName: string) {
-			return yield* searchLogs({ serviceName, limit: config.otel.logFetchLimit })
+			yield* Effect.annotateCurrentSpan("log.service_name", serviceName)
+			const logs = yield* searchLogs({ serviceName, limit: config.otel.logFetchLimit })
+			yield* Effect.annotateCurrentSpan("log.result_count", logs.length)
+			return logs
 		})
 
 		const listFacets = Effect.fn("motel/TelemetryStore.listFacets")(function* (input: FacetSearch) {
@@ -1974,26 +2048,30 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 						// FACET_VALUE_MAX_LEN. For opencode this hides `ai.prompt`,
 						// `ai.prompt.messages`, and `ai.prompt.tools` — which are 1-6MB text
 						// blobs that you'd never want to filter by exact match anyway. The
-						// WHERE clause lets SQLite skip reading those pages from disk. We also
-						// dedupe to one (trace, key, value) row before grouping so repeated
-						// span-level duplicates don't blow up the temp B-trees used for the
-						// picker ranking query.
-						const params: Array<string | number> = [FACET_VALUE_MAX_LEN, cutoff]
-						if (input.serviceName) params.push(input.serviceName)
-						params.push(limit)
+						// WHERE clause lets SQLite skip reading those pages from disk.
+						// COUNT(DISTINCT ...) does its own per-group dedup via a temp B-tree,
+						// so the outer query needs no DISTINCT subquery in front of it. We
+						// pre-filter trace_ids through trace_summaries (an indexed lookup) so
+						// the planner can use a SEMI JOIN against the small in-window set
+						// instead of joining every span_attributes row to trace_summaries.
+						const params: Array<string | number> = []
+						let traceFilter: string
+						if (input.serviceName) {
+							traceFilter = `(SELECT trace_id FROM trace_summaries WHERE started_at_ms >= ? AND service_name = ?)`
+							params.push(cutoff, input.serviceName)
+						} else {
+							traceFilter = `(SELECT trace_id FROM trace_summaries WHERE started_at_ms >= ?)`
+							params.push(cutoff)
+						}
+						params.push(FACET_VALUE_MAX_LEN, limit)
 						const rows = db.query(`
-							SELECT scoped.key AS value,
-							       COUNT(DISTINCT scoped.trace_id) AS count,
-							       COUNT(DISTINCT scoped.value) AS distinct_values
-							FROM (
-								SELECT DISTINCT sa.trace_id, sa.key, sa.value
-								FROM span_attributes sa
-								JOIN trace_summaries ts ON ts.trace_id = sa.trace_id
-								WHERE LENGTH(sa.value) < ?
-								  AND ts.started_at_ms >= ?
-								  ${input.serviceName ? "AND ts.service_name = ?" : ""}
-							) AS scoped
-							GROUP BY scoped.key
+							SELECT key AS value,
+							       COUNT(DISTINCT trace_id) AS count,
+							       COUNT(DISTINCT value) AS distinct_values
+							FROM span_attributes
+							WHERE trace_id IN ${traceFilter}
+							  AND LENGTH(value) < ?
+							GROUP BY key
 							ORDER BY (CASE WHEN distinct_values = 1 THEN 1 ELSE 0 END) ASC,
 							         distinct_values DESC,
 							         count DESC,
@@ -2030,7 +2108,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const listTraceLogs = Effect.fn("motel/TelemetryStore.listTraceLogs")(function* (traceId: string) {
-			return yield* searchLogs({ traceId, limit: config.otel.logFetchLimit })
+			yield* Effect.annotateCurrentSpan("log.trace_id", traceId)
+			const logs = yield* searchLogs({ traceId, limit: config.otel.logFetchLimit })
+			yield* Effect.annotateCurrentSpan("log.result_count", logs.length)
+			return logs
 		})
 
 		// ---------------------------------------------------------------------------
@@ -2436,8 +2517,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			getAiCall,
 			aiCallStats,
 		})
-	}),
-)
+	})
+
+/** Compatibility factory for callers constructing a writer/query-capable store layer. */
+export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) =>
+	Layer.effect(TelemetryStore, makeTelemetryStoreEffect(opts)).pipe(Layer.provide(BunFileSystem.layer))
 
 /**
  * Default writer instance: the main daemon uses this. Owns schema
@@ -2454,9 +2538,11 @@ export const TelemetryStoreLive = makeTelemetryStoreLayer({ readonly: false, run
 export const TelemetryStoreWorkerLive = makeTelemetryStoreLayer({ readonly: false, runRetention: false })
 
 /**
- * Read-only instance for query-only processes (currently the TUI).
- * Skips every DDL/DML statement at startup so the connection can be
- * opened while a writer is mid-transaction without racing for the
- * write lock. Writes through the service interface will throw.
+ * Read-only instance for query-only processes (currently the TUI and
+ * HTTP query handlers). Skips every DDL/DML statement at startup so
+ * the connection can be opened while a writer is mid-transaction
+ * without racing for the write lock. Provided as TelemetryStoreReadonly
+ * — a distinct service identifier so it can coexist with the writer
+ * TelemetryStore in the same runtime.
  */
-export const TelemetryStoreReadonlyLive = makeTelemetryStoreLayer({ readonly: true, runRetention: false })
+export const TelemetryStoreReadonlyLive = Layer.effect(TelemetryStoreReadonly, makeTelemetryStoreEffect({ readonly: true, runRetention: false })).pipe(Layer.provide(BunFileSystem.layer))

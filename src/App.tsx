@@ -14,16 +14,14 @@ import {
 	attrPickerInputAtom,
 	attrPickerModeAtom,
 	attrFacetStateAtom,
-	chatDetailChunkIdAtom,
-	chatDetailScrollOffsetAtom,
 	noticeAtom,
-	persistSelectedTheme,
 	selectedAttrIndexAtom,
-	selectedChatChunkIdAtom,
 	selectedThemeAtom,
 	waterfallFilterModeAtom,
 	waterfallFilterTextAtom,
-} from "./ui/state.ts"
+} from "./ui/atoms.ts"
+import { chatDetailChunkIdAtom, chatDetailScrollOffsetAtom, selectedChatChunkIdAtom } from "./ui/aiState.ts"
+import { persistSelectedTheme } from "./ui/persistence.ts"
 import type { ThemeName } from "./ui/theme.ts"
 import { applyTheme, colors, SEPARATOR, themeLabel } from "./ui/theme.ts"
 import { useKeyboardNav } from "./ui/useKeyboardNav.ts"

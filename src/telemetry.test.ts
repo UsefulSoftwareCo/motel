@@ -321,6 +321,18 @@ describe("motel telemetry store", () => {
 		expect(result?.span.depth).toBe(1)
 	})
 
+	it("uses the canonical earliest root when directly looking up a later root span", async () => {
+		const result = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore.asEffect(), (store) => store.getSpan("ai-stream-2")).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+
+		expect(result?.traceId).toBe("trace-ai")
+		expect(result?.span.operationName).toBe("ai.generateText")
+		expect(result?.rootOperationName).toBe("ai.streamText")
+	})
+
 	it("filters logs by spanId", async () => {
 		const result = await storeRuntime.runPromise(
 			Effect.flatMap(TelemetryStore.asEffect(), (store) =>
@@ -851,5 +863,41 @@ describe("motel telemetry store", () => {
 		expect(motelOpenApiSpec.paths["/api/ai/calls"]).toBeDefined()
 		expect(motelOpenApiSpec.paths["/api/ai/calls/{spanId}"]).toBeDefined()
 		expect(motelOpenApiSpec.paths["/api/ai/stats"]).toBeDefined()
+	})
+
+	it("lists services with recent child-span activity even when the root started earlier", async () => {
+		const nowNanos = BigInt(Date.now()) * 1_000_000n
+		const oldRootNanos = nowNanos - 2n * 24n * 60n * 60n * 1_000_000_000n
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore.asEffect(), (store) => store.ingestTraces({
+				resourceSpans: [{
+					resource: { attributes: [{ key: "service.name", value: { stringValue: "active-child-only" } }] },
+					scopeSpans: [{
+						spans: [{
+							traceId: "trace-active-child",
+							spanId: "old-root",
+							name: "old.root",
+							startTimeUnixNano: String(oldRootNanos),
+							endTimeUnixNano: String(oldRootNanos + 1_000_000n),
+						}, {
+							traceId: "trace-active-child",
+							spanId: "recent-child",
+							parentSpanId: "old-root",
+							name: "recent.child",
+							startTimeUnixNano: String(nowNanos),
+							endTimeUnixNano: String(nowNanos + 1_000_000n),
+						}],
+					}],
+				}],
+			})).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		const services = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore.asEffect(), (store) => store.listServices).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+
+		expect(services).toContain("active-child-only")
 	})
 })

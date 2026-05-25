@@ -11,7 +11,7 @@ import {
 } from "./aiChatModel.ts"
 import { formatDuration, truncateText } from "./format.ts"
 import { AlignedHeaderLine, BlankRow, Divider, PlainLine, TextLine } from "./primitives.tsx"
-import type { AiCallDetailState } from "./state.ts"
+import type { AiCallDetailState } from "./aiState.ts"
 import { colors, SEPARATOR } from "./theme.ts"
 
 export const AI_CHAT_HEADER_ROWS = 4

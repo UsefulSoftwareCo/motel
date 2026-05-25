@@ -2,7 +2,7 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { Children } from "react"
 import { colors } from "./theme.ts"
 import { fitCell, truncateText } from "./format.ts"
-import type { DetailView } from "./state.ts"
+import type { DetailView } from "./atoms.ts"
 
 export const BlankRow = () => <box height={1} />
 

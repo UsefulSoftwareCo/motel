@@ -1,14 +1,14 @@
 import { Effect } from "effect"
 import { config } from "../config.ts"
 import { queryRuntime } from "../runtime.ts"
-import { LogQueryService } from "../services/LogQueryService.ts"
-import { TraceQueryService } from "../services/TraceQueryService.ts"
+import { TelemetryStoreReadonly } from "../services/TelemetryStore.ts"
+import { makeCachedLoader } from "./cachedLoader.ts"
 
 export const loadTraceServices = () =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.listServices))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listServices))
 
 export const loadRecentTraceSummaries = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.listTraceSummaries(serviceName)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listTraceSummaries(serviceName)))
 
 /**
  * Server-side trace summary search. Accepts any combination of:
@@ -29,7 +29,7 @@ export const loadFilteredTraceSummaries = (
 		readonly aiText?: string | null
 	},
 ) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.searchTraceSummaries({
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.searchTraceSummaries({
 		serviceName,
 		attributeFilters: options.attributeFilters,
 		aiText: options.aiText ?? null,
@@ -37,10 +37,10 @@ export const loadFilteredTraceSummaries = (
 	})))
 
 export const loadTraceAttributeKeys = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_keys", serviceName, limit: 200 })))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_keys", serviceName, limit: 200 })))
 
 export const loadTraceAttributeValues = (serviceName: string, key: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_values", serviceName, key, limit: 200 })))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_values", serviceName, key, limit: 200 })))
 
 // ---------------------------------------------------------------------------
 // Facet cache (drives the `f` attribute filter picker)
@@ -56,65 +56,46 @@ export interface FacetCacheEntry {
 	readonly fetchedAt: Date
 }
 
-const facetKeysCache = new Map<string, FacetCacheEntry>()
-const facetValuesCache = new Map<string, FacetCacheEntry>()
-const facetKeysInflight = new Map<string, Promise<FacetCacheEntry>>()
-const facetValuesInflight = new Map<string, Promise<FacetCacheEntry>>()
+const wrapWithTimestamp = (data: readonly FacetRow[]): FacetCacheEntry => ({ data, fetchedAt: new Date() })
 
-const valuesKey = (service: string, key: string) => `${service}\u0000${key}`
+const facetKeysLoader = makeCachedLoader<string, FacetCacheEntry>({
+	load: (service) => loadTraceAttributeKeys(service).then(wrapWithTimestamp),
+})
+
+const facetValuesLoader = makeCachedLoader<{ readonly service: string; readonly key: string }, FacetCacheEntry>({
+	hash: ({ service, key }) => `${service}\u0000${key}`,
+	load: ({ service, key }) => loadTraceAttributeValues(service, key).then(wrapWithTimestamp),
+})
 
 export const getCachedFacetKeys = (service: string): FacetCacheEntry | null =>
-	facetKeysCache.get(service) ?? null
+	facetKeysLoader.get(service) ?? null
 
 export const getCachedFacetValues = (service: string, key: string): FacetCacheEntry | null =>
-	facetValuesCache.get(valuesKey(service, key)) ?? null
+	facetValuesLoader.get({ service, key }) ?? null
 
-export const ensureTraceAttributeKeys = (service: string): Promise<FacetCacheEntry> => {
-	const existing = facetKeysInflight.get(service)
-	if (existing) return existing
-	const request = loadTraceAttributeKeys(service)
-		.then((data) => {
-			const entry = { data, fetchedAt: new Date() } satisfies FacetCacheEntry
-			facetKeysCache.set(service, entry)
-			return entry
-		})
-		.finally(() => {
-			facetKeysInflight.delete(service)
-		})
-	facetKeysInflight.set(service, request)
-	return request
-}
+export const ensureTraceAttributeKeys = (service: string): Promise<FacetCacheEntry> =>
+	facetKeysLoader.ensure(service)
 
-export const ensureTraceAttributeValues = (service: string, key: string): Promise<FacetCacheEntry> => {
-	const cacheKey = valuesKey(service, key)
-	const existing = facetValuesInflight.get(cacheKey)
-	if (existing) return existing
-	const request = loadTraceAttributeValues(service, key)
-		.then((data) => {
-			const entry = { data, fetchedAt: new Date() } satisfies FacetCacheEntry
-			facetValuesCache.set(cacheKey, entry)
-			return entry
-		})
-		.finally(() => {
-			facetValuesInflight.delete(cacheKey)
-		})
-	facetValuesInflight.set(cacheKey, request)
-	return request
-}
+export const refreshTraceAttributeKeys = (service: string): Promise<FacetCacheEntry> =>
+	facetKeysLoader.refresh(service)
+
+export const ensureTraceAttributeValues = (service: string, key: string): Promise<FacetCacheEntry> =>
+	facetValuesLoader.ensure({ service, key })
+
+export const refreshTraceAttributeValues = (service: string, key: string): Promise<FacetCacheEntry> =>
+	facetValuesLoader.refresh({ service, key })
 
 /** Called from the refreshNonce effect alongside the trace / log cache clears. */
 export const invalidateFacetCaches = () => {
-	facetKeysCache.clear()
-	facetValuesCache.clear()
-	facetKeysInflight.clear()
-	facetValuesInflight.clear()
+	facetKeysLoader.invalidate()
+	facetValuesLoader.invalidate()
 }
 
 export const loadTraceDetail = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.getTrace(traceId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.getTrace(traceId)))
 
 export const loadTraceLogs = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(LogQueryService.asEffect(), (service) => service.listTraceLogs(traceId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listTraceLogs(traceId)))
 
 export const loadServiceLogs = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(LogQueryService.asEffect(), (service) => service.listRecentLogs(serviceName)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listRecentLogs(serviceName)))

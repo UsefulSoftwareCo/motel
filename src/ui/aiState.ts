@@ -2,8 +2,9 @@ import { Effect } from "effect"
 import * as Atom from "effect/unstable/reactivity/Atom"
 import type { AiCallDetail } from "../domain.ts"
 import { queryRuntime } from "../runtime.ts"
-import { TraceQueryService } from "../services/TraceQueryService.ts"
+import { TelemetryStoreReadonly } from "../services/TelemetryStore.ts"
 import type { LoadStatus } from "./atoms.ts"
+import { makeCachedLoader } from "./cachedLoader.ts"
 
 // AI chat view (full-screen when drilled into an `isAiSpan` span).
 // ---------------------------------------------------------------------
@@ -37,35 +38,22 @@ export const initialAiCallDetailState: AiCallDetailState = {
 export const aiCallDetailStateAtom = Atom.make(initialAiCallDetailState).pipe(Atom.keepAlive)
 
 export const loadAiCallDetail = (spanId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.getAiCall(spanId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.getAiCall(spanId)))
 
 // AI call detail cache: the `ai.prompt` payload can easily be 50KB+ and
 // we don't want to re-hit SQLite every time j/k moves the selection
 // between adjacent AI spans. Cleared alongside the other per-refresh
 // caches in `useTraceScreenData`.
-const aiCallDetailCache = new Map<string, AiCallDetail | null>()
-const aiCallDetailInflight = new Map<string, Promise<AiCallDetail | null>>()
+const aiCallDetailLoader = makeCachedLoader<string, AiCallDetail | null>({
+	load: loadAiCallDetail,
+})
 
 export const getCachedAiCallDetail = (spanId: string): AiCallDetail | null | undefined =>
-	aiCallDetailCache.has(spanId) ? aiCallDetailCache.get(spanId) ?? null : undefined
+	aiCallDetailLoader.get(spanId)
 
-export const ensureAiCallDetail = (spanId: string): Promise<AiCallDetail | null> => {
-	if (aiCallDetailCache.has(spanId)) return Promise.resolve(aiCallDetailCache.get(spanId) ?? null)
-	const existing = aiCallDetailInflight.get(spanId)
-	if (existing) return existing
-	const request = loadAiCallDetail(spanId)
-		.then((data) => {
-			aiCallDetailCache.set(spanId, data)
-			return data
-		})
-		.finally(() => {
-			aiCallDetailInflight.delete(spanId)
-		})
-	aiCallDetailInflight.set(spanId, request)
-	return request
-}
+export const ensureAiCallDetail = (spanId: string): Promise<AiCallDetail | null> =>
+	aiCallDetailLoader.ensure(spanId)
 
 export const invalidateAiCallDetailCache = () => {
-	aiCallDetailCache.clear()
-	aiCallDetailInflight.clear()
+	aiCallDetailLoader.invalidate()
 }

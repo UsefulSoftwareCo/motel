@@ -35,20 +35,20 @@ interactive and will block your shell:
 motel start
 ```
 
-`motel start` ensures a managed daemon process is running, writes a
-lockfile under `.motel-data/`, and returns a JSON status blob. It's
-idempotent — safe to call repeatedly. If motel isn't on `PATH`, fall
+`motel start` ensures the machine-global managed daemon is running, writes
+runtime files under `${XDG_STATE_HOME:-~/.local/state}/motel/`, and returns a
+JSON status blob. It is idempotent and shared across local projects. If motel isn't on `PATH`, fall
 back to `bunx @kitlangton/motel start`.
 
 After starting, re-check `GET /api/health` (may take 1–2s to become
-ready). If it still fails, read `.motel-data/daemon.log` for the error
+ready). If it still fails, read `${XDG_STATE_HOME:-~/.local/state}/motel/daemon.log` for the error
 and surface it to the user.
 
 Other lifecycle commands, for reference:
 
 ```bash
-motel status   # JSON status (running? pid? workdir?)
-motel stop     # stop the managed daemon for this workdir
+motel status   # JSON status (running? pid? originating workdir?)
+motel stop     # stop the shared managed daemon for all local projects
 ```
 
 Discover reporting services with `GET /api/services` when needed.

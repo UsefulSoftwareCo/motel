@@ -13,18 +13,13 @@ import {
 	attrPickerInputAtom,
 	attrPickerModeAtom,
 	autoRefreshAtom,
-	chatDetailChunkIdAtom,
-	chatDetailScrollOffsetAtom,
 	collapsedSpanIdsAtom,
 	detailViewAtom,
 	filterModeAtom,
 	filterTextAtom,
-	getCachedFacetKeys,
-	getCachedFacetValues,
 	initialAttrFacetState,
 	refreshNonceAtom,
 	selectedAttrIndexAtom,
-	selectedChatChunkIdAtom,
 	selectedThemeAtom,
 	selectedServiceLogIndexAtom,
 	selectedSpanIndexAtom,
@@ -37,7 +32,9 @@ import {
 	traceStateAtom,
 	waterfallFilterModeAtom,
 	waterfallFilterTextAtom,
-} from "./state.ts"
+} from "./atoms.ts"
+import { chatDetailChunkIdAtom, chatDetailScrollOffsetAtom, selectedChatChunkIdAtom } from "./aiState.ts"
+import { getCachedFacetKeys, getCachedFacetValues } from "./loaders.ts"
 import { filterFacets } from "./AttrFilterModal.tsx"
 import { G_PREFIX_TIMEOUT_MS } from "./theme.ts"
 import { cycleThemeName, themeLabel } from "./theme.ts"
