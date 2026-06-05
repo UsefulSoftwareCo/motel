@@ -5,10 +5,8 @@
  *
  * Only ingestTraces and ingestLogs run through RPC — those are the
  * methods whose SQLite writes used to block the main event loop for
- * seconds at a time. Every other TelemetryStore method stays on the
- * main thread with its own direct DB connection; SQLite's WAL mode
- * lets the reader (main) and writer (worker) hold independent
- * connections to the same file concurrently without contention.
+ * seconds at a time. Read-only TelemetryStore methods use the separate
+ * query RPC worker so no synchronous SQLite call runs on the HTTP thread.
  *
  * Payloads are typed as Schema.Unknown because OTLP's protobuf-JSON
  * shape is enormous and nested — the store validates structurally

@@ -98,6 +98,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `src/server.ts` runs the local server without the TUI.
 - `src/instructions.ts` contains the copied setup instructions for other Effect apps.
 - `src/services/TelemetryStore.ts` persists traces and logs in SQLite and exposes indexed queries through writer and read-only service identifiers.
+- `src/services/TelemetryQuery.ts` proxies read-only store calls to `src/services/telemetryQueryWorker.ts`, keeping synchronous Bun SQLite queries off the HTTP event loop.
 - `src/config.ts` is the source of truth for ports and env-driven OTEL settings.
 - `web/` is a Vite + React SPA for the browser-based UI (Tailwind CSS, `@effect/atom-react`, `AtomHttpApi`).
 - `web/src/api.ts` creates the typed `AtomHttpApi.Service` client from `src/httpApi.ts`.
@@ -106,15 +107,14 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - The server in `src/localServer.ts` serves `web/dist/` as static files with SPA fallback for non-API routes.
 
 ## Tests
-- `bun test` runs the suite. Three kinds of tests live in the repo:
+- `bun run test` runs the suite. Three kinds of tests live in the repo:
   - `src/telemetry.test.ts` exercises the SQLite TelemetryStore with
     OTLP payloads end-to-end.
   - `src/ui/waterfallNav.test.ts` unit-tests the pure collapse/expand
     resolver (no UI).
   - `src/ui/*.repro.test.ts` drive the real TUI under `tuistory` to
-    reproduce regressions; each has a sibling `*.repro.seed.ts` that
-    seeds a deterministic trace into SQLite in a child process. These
-    are auto-skipped when `tuistory` isn't installed.
+    reproduce regressions, using deterministic traces seeded into SQLite
+    by child processes. They become no-op passes when `tuistory` is absent.
 
 ## Effect Observability Guidance
 - Inspect the target repo’s existing Effect runtime and observability wiring before adding anything new.
@@ -140,11 +140,15 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `MOTEL_OTEL_LOGS_EXPORTER_URL`: defaults to `http://127.0.0.1:27686/v1/logs`
 - `MOTEL_OTEL_QUERY_URL`: defaults to `http://127.0.0.1:27686`
 - `MOTEL_OTEL_DB_PATH`: defaults to `${XDG_STATE_HOME:-~/.local/state}/motel/telemetry.sqlite` (one shared DB per machine; daemon log + lock + instance registry live in the same directory)
+- `MOTEL_RUNTIME_DIR`: overrides the daemon log, lock, and instance-registry directory (primarily for isolated tests and custom managed instances)
 - `MOTEL_OTEL_TRACE_LOOKBACK_MINUTES`: defaults to `1440` (24h)
 - `MOTEL_OTEL_TRACE_LIMIT`: defaults to `100`
 - `MOTEL_OTEL_LOG_LIMIT`: defaults to `80`
 - `MOTEL_OTEL_RETENTION_HOURS`: defaults to `168` (7d)
 - `MOTEL_OTEL_MAX_DB_SIZE_MB`: defaults to `1024` (size-based retention cap)
+- `MOTEL_OTEL_RETENTION_TRACE_BATCH`: defaults to `100` completed traces per cleanup pass
+- `MOTEL_OTEL_RETENTION_LOG_BATCH`: defaults to `5000` logs per cleanup pass
+- `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`: defaults to `10`
 
 ## TUI Keys
 - `?`: toggle shortcut help

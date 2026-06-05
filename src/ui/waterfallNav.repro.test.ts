@@ -103,6 +103,8 @@ const SERVICE_NAME = "waterfall-repro"
 describe("waterfall collapse/expand (end-to-end TUI)", () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "motel-repro-"))
 	const dbPath = join(tempDir, "telemetry.sqlite")
+	const port = 40_000 + Math.floor(Math.random() * 5_000)
+	const daemonEnv = { MOTEL_RUNTIME_DIR: tempDir, MOTEL_OTEL_DB_PATH: dbPath, MOTEL_OTEL_BASE_URL: `http://127.0.0.1:${port}`, MOTEL_OTEL_QUERY_URL: `http://127.0.0.1:${port}`, MOTEL_OTEL_PORT: String(port) }
 	const lastServicePath = join(tempDir, "last-service.txt")
 	let canRun = false
 
@@ -122,6 +124,7 @@ describe("waterfall collapse/expand (end-to-end TUI)", () => {
 			cwd: process.cwd(),
 			env: {
 				...process.env,
+				...daemonEnv,
 				MOTEL_OTEL_DB_PATH: dbPath,
 				MOTEL_OTEL_RETENTION_HOURS: "24",
 				MOTEL_OTEL_ENABLED: "false",
@@ -150,6 +153,10 @@ describe("waterfall collapse/expand (end-to-end TUI)", () => {
 			"--rows", "40",
 			"--cwd", process.cwd(),
 			"--env", `MOTEL_OTEL_DB_PATH=${dbPath}`,
+			"--env", `MOTEL_RUNTIME_DIR=${tempDir}`,
+			"--env", `MOTEL_OTEL_BASE_URL=${daemonEnv.MOTEL_OTEL_BASE_URL}`,
+			"--env", `MOTEL_OTEL_QUERY_URL=${daemonEnv.MOTEL_OTEL_QUERY_URL}`,
+			"--env", `MOTEL_OTEL_PORT=${port}`,
 			"--env", "MOTEL_OTEL_ENABLED=false",
 			"--timeout", "15000",
 		])
@@ -169,6 +176,8 @@ describe("waterfall collapse/expand (end-to-end TUI)", () => {
 	afterAll(async () => {
 		if (canRun) {
 			await tui(["close", "--session", SESSION])
+			const stop = Bun.spawn({ cmd: ["bun", "run", "src/motel.ts", "stop"], cwd: process.cwd(), env: { ...process.env, ...daemonEnv }, stdout: "ignore", stderr: "ignore" })
+			await stop.exited
 		}
 		try {
 			rmSync(tempDir, { recursive: true, force: true })

@@ -25,6 +25,7 @@ const Health = Schema.Struct({
 	workdir: Schema.String.pipe(Schema.annotateKey({ description: "Working directory at the time the server started. Used by MCP discovery to match the current project via longest-prefix." })),
 	startedAt: Schema.String.pipe(Schema.annotateKey({ description: "ISO 8601 timestamp of when the server bound its port." })),
 	version: Schema.String.pipe(Schema.annotateKey({ description: "Motel version string." })),
+	instanceId: Schema.optionalKey(Schema.String).pipe(Schema.annotateKey({ description: "Managed-daemon instance nonce used for readiness and safe shutdown identity checks." })),
 })
 const IngestTraceResponse = Schema.Struct({ insertedSpans: Schema.Number })
 const IngestLogResponse = Schema.Struct({ insertedLogs: Schema.Number })

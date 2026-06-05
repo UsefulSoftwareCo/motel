@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite"
 import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
 import { dirname } from "node:path"
-import { Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
+import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
@@ -481,6 +481,7 @@ export class TelemetryStore extends Context.Service<
 	TelemetryStoreReader & {
 		readonly ingestTraces: (payload: OtlpTraceExportRequest) => Effect.Effect<{ readonly insertedSpans: number }, Error>
 		readonly ingestLogs: (payload: OtlpLogExportRequest) => Effect.Effect<{ readonly insertedLogs: number }, Error>
+		readonly runRetentionNow: Effect.Effect<void, Error>
 	}
 >()("motel/TelemetryStore") {}
 
@@ -497,8 +498,7 @@ export class TelemetryStore extends Context.Service<
  *
  * - `runRetention` — fork the background cleanup loop (age + size cap
  *   eviction, WAL checkpoint). Only one process should own this at a
- *   time. Currently the main daemon (localServer) does; the ingest
- *   worker and the TUI skip it.
+ *   time. The ingest worker owns it; the HTTP thread and TUI skip it.
  */
 export interface TelemetryStoreOptions {
 	readonly readonly: boolean
@@ -556,10 +556,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			// an empty DB, or on the next VACUUM after a change. Setting it
 			// here, BEFORE the first CREATE TABLE, is the only path that
 			// makes incremental_vacuum work without a full VACUUM. For
-			// existing DBs that were created before this line moved here
-			// (auto_vacuum=NONE in the file header), we run a one-shot
-			// VACUUM below to convert the database. That conversion is the
-			// only place we're forced to take a brief stop-the-world lock.
+			// existing DBs that predate this setting keep their current mode;
+			// Motel never performs a surprise full-file VACUUM at startup.
 			try { db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`) } catch { /* ignore */ }
 			try {
 				db.exec(`
@@ -655,6 +653,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 					CREATE INDEX IF NOT EXISTS idx_log_attributes_key_value ON log_attributes(key, value, log_id);
 					CREATE INDEX IF NOT EXISTS idx_log_attributes_log_id ON log_attributes(log_id);
+
+					CREATE TABLE IF NOT EXISTS motel_maintenance (
+						key TEXT PRIMARY KEY,
+						value TEXT NOT NULL
+					);
 				`)
 			} catch (err) {
 				if (!isSqliteLockError(err)) throw err
@@ -675,7 +678,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			} catch { hasFts = false }
 			try {
 				const row = db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name='span_attr_fts'`).get()
-				hasAttrFts = row !== null
+				const backfill = db.query(`SELECT value FROM motel_maintenance WHERE key = 'span_attr_fts_v1'`).get() as { value: string } | null
+				hasAttrFts = row !== null && backfill?.value === "complete"
 			} catch { hasAttrFts = false }
 		}
 
@@ -774,10 +778,6 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		// pay 3-4s on cold open instead of 400ms.
 		try {
 			db.exec(`PRAGMA analysis_limit = 1000; PRAGMA optimize;`)
-			// First-time databases won't have sqlite_stat1 until we run a
-			// real ANALYZE. Force it once if stats haven't been collected.
-			const hasStats = db.query(`SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1' LIMIT 1`).get() !== null
-			if (!hasStats) db.exec(`ANALYZE;`)
 		} catch {
 			// ANALYZE / optimize failures are never fatal — queries still work,
 			// they just run with default row estimates.
@@ -828,22 +828,19 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			)
 		`)
 
-		const rebuildTraceSummaries = db.query(`
-			INSERT INTO trace_summaries (
-				trace_id, service_name, root_operation_name, started_at_ms, ended_at_ms, active_span_count, duration_ms, span_count, error_count
-			)
-			${TRACE_SUMMARY_SELECT_SQL}
-			GROUP BY trace_id
-		`)
-
 		const reconcileTraceSummaries = Effect.sync(() => {
-			try {
-				db.query(`DELETE FROM trace_summaries`).run()
-				rebuildTraceSummaries.run()
-			} catch (err) {
-				if (!isSqliteLockError(err)) throw err
-				console.warn(`motel: trace summary rebuild skipped during startup: ${(err as Error).message}`)
+			const marker = db.query(`SELECT value FROM motel_maintenance WHERE key = 'trace_summary_cursor'`).get() as { value: string } | null
+			const cursor = Number(marker?.value ?? 0)
+			const rows = db.query(`SELECT rowid, trace_id FROM spans WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`).all(cursor, config.otel.retentionTraceBatch) as Array<{ rowid: number; trace_id: string }>
+			if (rows.length === 0) {
+				db.query(`INSERT OR REPLACE INTO motel_maintenance(key, value) VALUES ('trace_summary_cursor', '0')`).run()
+				return
 			}
+			const transaction = db.transaction(() => {
+				for (const traceId of new Set(rows.map((row) => row.trace_id))) upsertTraceSummary.run(traceId)
+				db.query(`INSERT OR REPLACE INTO motel_maintenance(key, value) VALUES ('trace_summary_cursor', ?)`).run(String(rows.at(-1)!.rowid))
+			})
+			transaction()
 		})
 
 		const deleteSpanAttributes = db.query(`DELETE FROM span_attributes WHERE trace_id = ? AND span_id = ?`)
@@ -997,12 +994,12 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				// Time-based: completed traces whose last span ended before cutoff.
 				const timeExpired = db.query(
-					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ?`,
-				).all(cutoff) as readonly { trace_id: string }[]
+					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ? ORDER BY ended_at_ms ASC LIMIT ?`,
+				).all(cutoff, config.otel.retentionTraceBatch) as readonly { trace_id: string }[]
 				for (const row of timeExpired) toEvict.add(row.trace_id)
 
-				// Size-based: if actual data exceeds cap, drop oldest 20% of the
-				// remaining completed traces. `(page_count - freelist_count)`
+				// Size-based: if actual data exceeds the target, drop one bounded
+				// batch of the oldest completed traces. `(page_count - freelist_count)`
 				// ignores freed-but-not-vacuumed pages so a large freelist doesn't
 				// trigger a deletion death spiral.
 				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
@@ -1010,22 +1007,22 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				const pageSize = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
 				const dbSize = (pageCount - freePages) * pageSize
 				if (dbSize > maxDbSizeBytes) {
-					const completedCount = (db.query(
-						`SELECT COUNT(*) AS c FROM trace_summaries WHERE active_span_count = 0`,
-					).get() as { c: number }).c
-					const traceCutCount = Math.max(1, Math.floor(completedCount * 0.2))
 					const oldest = db.query(
 						`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
-					).all(traceCutCount) as readonly { trace_id: string }[]
+					).all(config.otel.retentionTraceBatch) as readonly { trace_id: string }[]
 					// Set.add dedupes overlap with the time-expired batch above.
 					for (const row of oldest) toEvict.add(row.trace_id)
 				}
 
-				// Always prune orphan logs (no trace_id) by timestamp — they're
-				// not covered by trace eviction.
-				db.query(`DELETE FROM logs WHERE trace_id IS NULL AND timestamp_ms < ?`).run(cutoff)
-
-				if (toEvict.size === 0) return
+				// Logs have their own retention boundary. A correlated log may refer
+				// to a trace that was sampled elsewhere or never reached Motel, so
+				// tying log eviction to trace_summaries lets those rows grow forever.
+				const expiredLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp_ms < ? ORDER BY timestamp_ms ASC LIMIT ?)`).run(cutoff, config.otel.retentionLogBatch)
+				let deletedLogs = Number(expiredLogs.changes) > 0
+				if (dbSize > maxDbSizeBytes) {
+					const oversizedLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY timestamp_ms ASC LIMIT ?)`).run(config.otel.retentionLogBatch)
+					deletedLogs = deletedLogs || Number(oversizedLogs.changes) > 0
+				}
 
 				// Batch the trace-id list so the IN placeholders stay under
 				// SQLite's default limit (~999). Each batch wipes every row
@@ -1048,9 +1045,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				// Log-side orphans (log_attributes + FTS) are keyed by log.id,
 				// so prune what no longer has a parent log row.
-				db.query(`DELETE FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id)`).run()
+				const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
+				let deletedOrphans = Number(orphanAttributes.changes) > 0
 				try {
-					db.query(`DELETE FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER))`).run()
+					const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
+					deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
 				} catch {
 					// FTS table may not exist on old DBs.
 				}
@@ -1060,6 +1059,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
 				// when readers are active, which is the documented mechanism
 				// behind WAL/freelist starvation when ingest is busy.
+				if (toEvict.size === 0 && !deletedLogs && !deletedOrphans) return
 				try { db.exec(`PRAGMA wal_checkpoint(RESTART);`) } catch { /* ignore */ }
 
 				// Incremental FTS5 merge — DELETE on an FTS5-indexed row
@@ -1077,32 +1077,14 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			})
 		})
 
-		// Retention only runs in processes that opt in (currently the main
-		// daemon). The ingest worker and TUI skip it to avoid two writers
-		// competing for the write lock with overlapping DELETE passes.
+		// Retention only runs in the ingest worker so maintenance never blocks
+		// the HTTP event loop and no second writer duplicates cleanup work.
 		if (opts.runRetention) {
-			// Reconcile any summary drift from interrupted ingests, but do it
-			// after the server becomes healthy. Running this synchronously at
-			// open can sit behind another writer's lock for ~15s and make the
-			// daemon look hung even though the port is already bound.
-			yield* Effect.forkScoped(reconcileTraceSummaries)
-
-			// auto_vacuum is configured at schema-init time (see above). For
-			// older databases that were created before that line was in
-			// place, the file header still says auto_vacuum=NONE and
-			// incremental_vacuum is silently a no-op. Detect and convert
-			// in a forked fiber so server startup is not blocked by VACUUM
-			// on a multi-GB historical database.
-			yield* Effect.forkScoped(Effect.sync(() => {
-				try {
-					const mode = (db.query(`PRAGMA auto_vacuum`).get() as { auto_vacuum: number }).auto_vacuum
-					if (mode === 2) return // already INCREMENTAL
-					db.exec(`PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`)
-				} catch { /* ignore — new DBs won't need this; conversion will retry next startup */ }
-			}))
-
-			// Run cleanup every 60 seconds in the background, tied to the layer's scope
-			yield* Effect.forkScoped(Effect.repeat(cleanupExpired(), Schedule.spaced("60 seconds")))
+			// Cleanup runs on the telemetry worker, never the HTTP event loop.
+			yield* Effect.forkScoped(Effect.repeat(
+				Effect.andThen(reconcileTraceSummaries, cleanupExpired()).pipe(Effect.catchCause((cause) => Effect.logWarning(`motel: maintenance pass failed: ${Cause.pretty(cause)}`))),
+				Schedule.spaced(`${config.otel.retentionIntervalSeconds} seconds`),
+			))
 
 			// Page reclamation runs on a separate, faster cadence (10s) and
 			// is independent of the eviction loop. The reason: a single sweep
@@ -1123,35 +1105,48 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			yield* Effect.forkScoped(Effect.repeat(refreshPlannerStats, Schedule.spaced("15 minutes")))
 		}
 
-		// One-time backfill for existing DBs: if span_attr_fts is empty but
-		// span_attributes has rows with AI_FTS_KEYS, populate the index.
-		// Runs forked so server startup isn't blocked; queries hitting the
-		// FTS will just return empty until the fill lands. On a 2 GB DB with
-		// ~400 matching rows this takes ~3-8 seconds. Writer-only because
-		// it does INSERT INTO ... — readonly connections would error.
+		// Incrementally rebuild historical AI attributes in bounded batches.
+		// Queries fall back to LIKE until the persistent marker is complete.
 		if (hasAttrFts && !opts.readonly) {
-			const backfillAttrFts = Effect.sync(() => {
+			const backfillAttrFtsBatch = Effect.sync(() => {
 				try {
-					const ftsCount = (db.query(`SELECT COUNT(*) AS c FROM span_attr_fts`).get() as { c: number }).c
-					if (ftsCount > 0) return
 					const keyList = AI_FTS_KEYS.map((k) => `'${k.replace(/'/g, "''")}'`).join(", ")
-					const attrCount = (db.query(
-						`SELECT COUNT(*) AS c FROM span_attributes WHERE key IN (${keyList})`,
-					).get() as { c: number }).c
-					if (attrCount === 0) return
-					// Single INSERT..SELECT is atomic and fast; FTS5 batches
-					// its internal segment writes. No transaction wrapper
-					// needed — it runs as one statement.
-					db.exec(`
-						INSERT INTO span_attr_fts(rowid, value)
-						SELECT rowid, value FROM span_attributes WHERE key IN (${keyList})
-					`)
+					const marker = db.query(`SELECT value FROM motel_maintenance WHERE key = 'span_attr_fts_v1'`).get() as { value: string } | null
+					if (marker?.value === "complete") return false
+					let cursor = 0
+					let maxRowId = 0
+					if (marker) {
+						[cursor, maxRowId] = marker.value.split(":").map(Number)
+					} else {
+						maxRowId = (db.query(`SELECT COALESCE(MAX(rowid), 0) AS value FROM span_attributes`).get() as { value: number }).value
+						db.query(`INSERT INTO span_attr_fts(span_attr_fts) VALUES ('delete-all')`).run()
+						db.query(`INSERT OR REPLACE INTO motel_maintenance(key, value) VALUES ('span_attr_fts_v1', ?)`).run(`0:${maxRowId}`)
+					}
+					const rows = db.query(`SELECT rowid, value FROM span_attributes WHERE key IN (${keyList}) AND rowid > ? AND rowid <= ? ORDER BY rowid ASC LIMIT 500`).all(cursor, maxRowId) as Array<{ rowid: number; value: string }>
+					if (rows.length === 0) {
+						db.query(`UPDATE motel_maintenance SET value = 'complete' WHERE key = 'span_attr_fts_v1'`).run()
+						hasAttrFts = true
+						return false
+					}
+					const insert = db.query(`INSERT INTO span_attr_fts(rowid, value) VALUES (?, ?)`)
+					const transaction = db.transaction(() => {
+						for (const row of rows) insert.run(row.rowid, row.value)
+						db.query(`UPDATE motel_maintenance SET value = ? WHERE key = 'span_attr_fts_v1'`).run(`${rows.at(-1)!.rowid}:${maxRowId}`)
+					})
+					transaction()
+					return true
 				} catch {
 					// Backfill failure is never fatal — new ingests still
 					// populate FTS via the trigger, and queries fall back to
 					// LIKE when FTS lookups return empty.
+					return true
 				}
 			})
+			const backfillAttrFts: Effect.Effect<void> = Effect.suspend(() =>
+				Effect.flatMap(backfillAttrFtsBatch, (pending) =>
+					pending ? Effect.andThen(Effect.sleep("100 millis"), backfillAttrFts) : Effect.void,
+				),
+			)
 			yield* Effect.forkScoped(backfillAttrFts)
 		}
 
@@ -2516,6 +2511,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			searchAiCalls,
 			getAiCall,
 			aiCallStats,
+			runRetentionNow: cleanupExpired(),
 		})
 	})
 
@@ -2524,18 +2520,15 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) =>
 	Layer.effect(TelemetryStore, makeTelemetryStoreEffect(opts)).pipe(Layer.provide(BunFileSystem.layer))
 
 /**
- * Default writer instance: the main daemon uses this. Owns schema
- * migrations, FTS backfill, and the retention loop.
+ * Default writer runtime used by tests and direct store consumers.
  */
 export const TelemetryStoreLive = makeTelemetryStoreLayer({ readonly: false, runRetention: true })
 
 /**
- * Writer instance that SKIPS retention. The ingest worker uses this
- * so the daemon and the worker aren't both running DELETE passes at
- * the same time (they'd just serialise behind the write lock and
- * duplicate work).
+ * The ingest worker's writer. It is the managed daemon's sole owner of
+ * schema migrations, FTS backfill, retention, and page reclamation.
  */
-export const TelemetryStoreWorkerLive = makeTelemetryStoreLayer({ readonly: false, runRetention: false })
+export const TelemetryStoreWorkerLive = TelemetryStoreLive
 
 /**
  * Read-only instance for query-only processes (currently the TUI and
@@ -2546,3 +2539,12 @@ export const TelemetryStoreWorkerLive = makeTelemetryStoreLayer({ readonly: fals
  * TelemetryStore in the same runtime.
  */
 export const TelemetryStoreReadonlyLive = Layer.effect(TelemetryStoreReadonly, makeTelemetryStoreEffect({ readonly: true, runRetention: false })).pipe(Layer.provide(BunFileSystem.layer))
+
+/** Query-worker reader that waits for the sole writer to finish schema bootstrap. */
+export const TelemetryStoreQueryWorkerLive = Layer.effect(
+	TelemetryStoreReadonly,
+	makeTelemetryStoreEffect({ readonly: true, runRetention: false }).pipe(
+		Effect.map((store) => TelemetryStoreReadonly.of(store)),
+		Effect.retry(Schedule.spaced("50 millis")),
+	),
+).pipe(Layer.provide(BunFileSystem.layer))

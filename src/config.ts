@@ -38,5 +38,8 @@ export const config = {
 		logFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_LOG_LIMIT, 80),
 		retentionHours: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_HOURS, 168),
 		maxDbSizeMb: parsePositiveInt(process.env.MOTEL_OTEL_MAX_DB_SIZE_MB, 1024),
+		retentionTraceBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_TRACE_BATCH, 100),
+		retentionLogBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_LOG_BATCH, 5_000),
+		retentionIntervalSeconds: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS, 10),
 	},
 } as const

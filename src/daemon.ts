@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
 import { Effect } from "effect"
-import { isAlive, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, MOTEL_VERSION, type RegistryEntry } from "./registry.js"
+import { isAlive, isManagedDaemonProcess, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, processIdentity, removeRegistryEntry, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
 const DEFAULT_HOST = "127.0.0.1"
@@ -35,11 +35,13 @@ type HealthShape = {
 	readonly workdir: string
 	readonly startedAt: string
 	readonly version: string
+	readonly instanceId?: string
 }
 
 type LockShape = {
 	readonly pid: number
 	readonly createdAt: string
+	readonly processIdentity?: string
 }
 
 type DaemonConfig = {
@@ -86,6 +88,9 @@ type DaemonOptions = {
 	readonly databasePath?: string
 	readonly host?: string
 	readonly port?: number
+	readonly startTimeoutMs?: number
+	readonly gracefulStopTimeoutMs?: number
+	readonly forceStopTimeoutMs?: number
 }
 
 export class DaemonError extends Error {
@@ -98,12 +103,14 @@ export class DaemonError extends Error {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const resolveConfig = (options: DaemonOptions = {}): DaemonConfig => {
+	const envBaseUrl = new URL(process.env.MOTEL_OTEL_BASE_URL?.trim() || process.env.MOTEL_OTEL_QUERY_URL?.trim() || `http://${DEFAULT_HOST}:${DEFAULT_PORT}`)
 	const repoRoot = path.resolve(options.repoRoot ?? DEFAULT_REPO_ROOT)
 	const workdir = path.resolve(options.workdir ?? process.cwd())
 	const runtimeDir = path.resolve(options.runtimeDir ?? motelStateDir())
-	const databasePath = path.resolve(options.databasePath ?? path.join(runtimeDir, "telemetry.sqlite"))
-	const host = options.host ?? DEFAULT_HOST
-	const port = options.port ?? DEFAULT_PORT
+	const databasePath = path.resolve(options.databasePath ?? process.env.MOTEL_OTEL_DB_PATH?.trim() ?? path.join(runtimeDir, "telemetry.sqlite"))
+	const host = options.host ?? process.env.MOTEL_OTEL_HOST?.trim() ?? envBaseUrl.hostname
+	const envPort = Number.parseInt(process.env.MOTEL_OTEL_PORT?.trim() || envBaseUrl.port, 10)
+	const port = options.port ?? (Number.isFinite(envPort) && envPort > 0 ? envPort : DEFAULT_PORT)
 	return {
 		repoRoot,
 		serverEntry: path.join(repoRoot, "src/server.ts"),
@@ -132,7 +139,9 @@ const pickByUrl = (entries: readonly RegistryEntry[], baseUrl: string, databaseP
 		.sort((a, b) => Number(b.databasePath === databasePath) - Number(a.databasePath === databasePath))[0] ?? null
 }
 
-const expectedEnv = (config: DaemonConfig) => ({
+const expectedEnv = (config: DaemonConfig, instanceId?: string) => ({
+	MOTEL_RUNTIME_DIR: config.runtimeDir,
+	...(instanceId ? { MOTEL_DAEMON_INSTANCE_ID: instanceId } : {}),
 	MOTEL_OTEL_BASE_URL: config.baseUrl,
 	MOTEL_OTEL_QUERY_URL: config.baseUrl,
 	MOTEL_OTEL_HOST: config.host,
@@ -144,14 +153,18 @@ const expectedEnv = (config: DaemonConfig) => ({
 
 export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager => {
 	const config = resolveConfig(options)
+	const startTimeoutMs = options.startTimeoutMs ?? START_TIMEOUT_MS
+	const gracefulStopTimeoutMs = options.gracefulStopTimeoutMs ?? STOP_TIMEOUT_MS
+	const forceStopTimeoutMs = options.forceStopTimeoutMs ?? 2_000
 	const mapError = (error: unknown) => new DaemonError(error instanceof Error ? error.message : String(error))
-	const readRegistryEntry = () => pickByUrl(listAliveEntries(), config.baseUrl, config.databasePath)
+	const readRegistryEntry = () => pickByUrl(listAliveEntries(config.runtimeDir), config.baseUrl, config.databasePath)
 
 	const fetchHealth = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<HealthShape | null> => {
 		try {
 			const response = await fetch(`${config.baseUrl}/api/health`, { signal: AbortSignal.timeout(timeoutMs) })
 			if (!response.ok) return null
-			return await response.json() as HealthShape
+			const health = await response.json() as HealthShape
+			return health.ok ? health : null
 		} catch {
 			return null
 		}
@@ -172,33 +185,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 	}
 
-	const startupMarkers = [`Listening on ${config.baseUrl}`, `motel local telemetry server listening on ${config.baseUrl}`]
-
-	const readLogSince = async (offset: number) => {
-		try {
-			const raw = await fsp.readFile(config.logPath, "utf8")
-			return raw.slice(offset)
-		} catch {
-			return ""
-		}
-	}
-
-	const detectStartedFromLog = async (pid: number, offset: number): Promise<HealthShape | null> => {
-		if (!isAlive(pid)) return null
-		const tail = await readLogSince(offset)
-		if (!startupMarkers.some((marker) => tail.includes(marker))) return null
-		return {
-			ok: true,
-			service: MOTEL_SERVICE_ID,
-			databasePath: config.databasePath,
-			pid,
-			url: config.baseUrl,
-			workdir: config.workdir,
-			startedAt: new Date().toISOString(),
-			version: MOTEL_VERSION,
-		}
-	}
-
 	const describeManagedMismatch = (health: HealthShape) => {
 		if (health.service !== MOTEL_SERVICE_ID) {
 			return `Port ${config.port} is in use by ${health.service}, not ${MOTEL_SERVICE_ID}.`
@@ -207,63 +193,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			return `Port ${config.port} is serving motel with ${health.databasePath}, expected ${config.databasePath}.`
 		}
 		return null
-	}
-
-	/**
-	 * Mismatch check against a registry entry — mirrors describeManagedMismatch
-	 * but drives off the registry file instead of an HTTP health response.
-	 * Used on the fast path in getStatus so warm-start doesn't need to wait
-	 * on an HTTP round-trip that may queue behind heavy OTLP ingest.
-	 *
-	 * The service-id check is implicit: any entry living in the motel
-	 * registry dir is by construction a motel daemon. databasePath is
-	 * optional for back-compat with entries written by older builds;
-	 * when absent we skip the DB check rather than refusing to adopt.
-	 */
-	const describeRegistryMismatch = (entry: RegistryEntry): string | null => {
-		if (entry.databasePath && entry.databasePath !== config.databasePath) {
-			return `Port ${config.port} is serving motel with ${entry.databasePath}, expected ${config.databasePath}.`
-		}
-		return null
-	}
-
-	/**
-	 * Build a DaemonStatus from a live registry entry. Returns null when
-	 * there's no entry for our URL/database, the registered pid isn't running, or
-	 * the entry is for a differently-configured daemon (different port).
-	 * This is the fast path: no HTTP, no event-loop round-trip, just a
-	 * directory read and a process.kill(pid, 0) liveness probe.
-	 */
-	const getStatusFromRegistry = (): DaemonStatus | null => {
-		const entry = readRegistryEntry()
-		if (!entry) return null
-		// Old registry entries do not identify the database they serve.
-		// Validate those through /api/health rather than adopting a possibly
-		// project-local daemon as the new shared global instance.
-		if (entry.databasePath === undefined) return null
-		// Port discriminator: a motel registry shared across several
-		// daemons (e.g., user running two instances on different
-		// ports from the same workdir, or a test harness on a random
-		// port) would otherwise have us adopt an unrelated daemon.
-		// URL match is a fast, unambiguous identity check.
-		if (entry.url !== config.baseUrl) return null
-		const mismatch = describeRegistryMismatch(entry)
-		return {
-			running: mismatch === null,
-			managed: mismatch === null,
-			service: MOTEL_SERVICE_ID,
-			pid: entry.pid,
-			url: entry.url,
-			databasePath: entry.databasePath,
-			workdir: entry.workdir,
-			startedAt: entry.startedAt,
-			version: entry.version,
-			sameWorkdir: workdirMatches(config.workdir, entry.workdir),
-			reason: mismatch,
-			logPath: config.logPath,
-			lockPath: config.lockPath,
-			registryPid: entry.pid,
-		}
 	}
 
 	const readLock = async (): Promise<LockShape | null> => {
@@ -281,7 +210,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			await fsp.rm(config.lockPath, { force: true })
 			return true
 		}
-		if (isAlive(current.pid)) return false
+		if (current.processIdentity ? processIdentity(current.pid) === current.processIdentity : isAlive(current.pid)) return false
 		await fsp.rm(config.lockPath, { force: true })
 		return true
 	}
@@ -293,7 +222,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		while (Date.now() < deadline) {
 			try {
 				const handle = await fsp.open(config.lockPath, "wx")
-				const contents = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() } satisfies LockShape)
+				const contents = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), processIdentity: processIdentity(process.pid) ?? undefined } satisfies LockShape)
 				await handle.writeFile(contents, "utf8")
 				return {
 					release: async () => {
@@ -317,29 +246,17 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		return fs.openSync(config.logPath, "a")
 	}
 
-	const waitForHealthy = async (pid: number, logOffset: number) => {
-		const deadline = Date.now() + START_TIMEOUT_MS
+	const waitForHealthy = async (pid: number, instanceId: string) => {
+		const deadline = Date.now() + startTimeoutMs
 		while (Date.now() < deadline) {
 			const health = await fetchHealth()
 			if (health) {
 				const mismatch = describeManagedMismatch(health)
-				if (!mismatch) return health
-				throw new Error(mismatch)
+				const registry = readRegistryEntry()
+				if (!mismatch && health.pid === pid && health.instanceId === instanceId && registry?.pid === pid && registry.instanceId === instanceId && isManagedDaemonProcess(registry) && await fetchIngestProbe()) return health
+				if (mismatch) throw new Error(mismatch)
 			}
-			const started = await detectStartedFromLog(pid, logOffset)
-			if (started) return started
 			if (!isAlive(pid)) {
-				// The spawned child is gone. Before declaring failure,
-				// do one patient probe: the child may have died from
-				// EADDRINUSE because another healthy motel is alive on
-				// the port but was answering /api/health too slowly for
-				// our fast poll. If that's the case, adopt it.
-				const patient = await fetchHealth(HEALTH_PATIENT_TIMEOUT_MS)
-				if (patient) {
-					const mismatch = describeManagedMismatch(patient)
-					if (!mismatch) return patient
-					throw new Error(mismatch)
-				}
 				throw new Error(`Daemon process ${pid} exited before becoming healthy. See ${config.logPath}.`)
 			}
 			await sleep(START_POLL_INTERVAL_MS)
@@ -347,43 +264,41 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		throw new Error(`Timed out waiting for daemon health at ${config.baseUrl}/api/health. See ${config.logPath}.`)
 	}
 
-	const stopPid = async (pid: number) => {
+	const waitUntilNotOwned = async (entry: RegistryEntry, timeoutMs: number) => {
+		const deadline = Date.now() + timeoutMs
+		while (Date.now() < deadline) {
+			if (!isManagedDaemonProcess(entry)) return true
+			await sleep(POLL_INTERVAL_MS)
+		}
+		return !isManagedDaemonProcess(entry)
+	}
+
+	const stopPid = async (entry: RegistryEntry) => {
+		if (!isManagedDaemonProcess(entry)) {
+			throw new Error(`Refusing to stop pid ${entry.pid}: registry identity does not match the running managed daemon.`)
+		}
 		try {
-			process.kill(pid, "SIGTERM")
+			process.kill(entry.pid, "SIGTERM")
 		} catch (error) {
 			const errno = error as NodeJS.ErrnoException
 			if (errno.code !== "ESRCH") throw error
 		}
 
-		const deadline = Date.now() + STOP_TIMEOUT_MS
-		while (Date.now() < deadline) {
-			if (!isAlive(pid)) return
-			const health = await fetchHealth()
-			if (health && health.pid !== pid) return
-			const registry = readRegistryEntry()
-			if (!health && (!registry || registry.pid !== pid)) return
-			await sleep(POLL_INTERVAL_MS)
+		if (!await waitUntilNotOwned(entry, gracefulStopTimeoutMs)) {
+			try {
+				process.kill(entry.pid, "SIGKILL")
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+			}
+			if (!await waitUntilNotOwned(entry, forceStopTimeoutMs)) {
+				throw new Error(`Timed out force-killing daemon ${entry.pid}.`)
+			}
 		}
-
-		throw new Error(`Timed out waiting for daemon ${pid} to stop.`)
+		const current = readRegistryEntry()
+		if (current?.pid === entry.pid && current.instanceId === entry.instanceId) removeRegistryEntry(entry.pid, config.runtimeDir)
 	}
 
 	const getStatus = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<DaemonStatus> => {
-		// Fast path: trust the local filesystem registry. When a motel
-		// daemon started on this machine it wrote an entry for its pid
-		// + URL + databasePath; if that entry is still there and the pid
-		// is alive, the daemon is almost certainly the one we want to
-		// adopt. HTTP health is skipped because the daemon's health
-		// endpoint can queue behind heavy OTLP ingest traffic, making
-		// the probe unreliable exactly when the daemon is busy.
-		const registryStatus = getStatusFromRegistry()
-		if (registryStatus) return registryStatus
-
-		// No local evidence → fall back to HTTP. Covers the edge cases
-		// where: a motel daemon is running but was started before this
-		// registry-first path shipped; OR the port is held by something
-		// entirely unrelated (the mismatch check turns that into a
-		// human-readable reason).
 		const registry = readRegistryEntry()
 		const health = await fetchHealth(timeoutMs)
 		if (!health) {
@@ -406,9 +321,10 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 
 		const mismatch = describeManagedMismatch(health)
+		const managed = mismatch === null && registry?.pid === health.pid && registry.instanceId === health.instanceId && isManagedDaemonProcess(registry)
 		return {
 			running: mismatch === null,
-			managed: mismatch === null,
+			managed,
 			service: health.service,
 			pid: health.pid,
 			url: health.url,
@@ -417,7 +333,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			startedAt: health.startedAt,
 			version: health.version,
 			sameWorkdir: workdirMatches(config.workdir, health.workdir),
-			reason: mismatch,
+			reason: mismatch ?? (managed ? null : "Responsive motel server is not an identity-verified managed daemon."),
 			logPath: config.logPath,
 			lockPath: config.lockPath,
 			registryPid: registry?.pid ?? null,
@@ -430,19 +346,22 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		// negative here drops us into the spawn path and collides with
 		// any slow-but-healthy daemon sitting on the port.
 		const existing = await getStatus(HEALTH_PATIENT_TIMEOUT_MS)
+		const existingEntry = readRegistryEntry()
 		if (existing.managed && existing.running) {
 			// /api/health can stay healthy after the lazy ingest worker/RPC path
 			// has been poisoned by an interrupted request. Empty OTLP posts are
 			// side-effect free and exercise the same path real exporters need.
 			if (existing.pid === process.pid || await fetchIngestProbe()) return existing
-			if (existing.pid !== null) await stopPid(existing.pid)
+			if (existingEntry) await stopPid(existingEntry)
 		}
+		if (!existing.running && existingEntry && isManagedDaemonProcess(existingEntry)) await stopPid(existingEntry)
 		if (existing.service !== null && existing.reason) {
 			throw new Error(existing.reason)
 		}
 
 		const lock = await acquireStartupLock()
 		let spawnedPid: number | null = null
+		let spawnedIdentity: string | null = null
 		try {
 			// Same reasoning for the post-lock re-check: another ensure()
 			// may have spawned a daemon between our first probe and the
@@ -451,14 +370,15 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			const rechecked = await getStatus(HEALTH_PATIENT_TIMEOUT_MS)
 			if (rechecked.managed && rechecked.running) {
 				if (rechecked.pid === process.pid || await fetchIngestProbe()) return rechecked
-				if (rechecked.pid !== null) await stopPid(rechecked.pid)
+				const recheckedEntry = readRegistryEntry()
+				if (recheckedEntry) await stopPid(recheckedEntry)
 			}
 			if (rechecked.service !== null && rechecked.reason) {
 				throw new Error(rechecked.reason)
 			}
 
 			const logFd = await openLogFile()
-			const logOffset = fs.fstatSync(logFd).size
+			const instanceId = crypto.randomUUID()
 			try {
 				const proc = Bun.spawn({
 					cmd: [process.execPath, "run", config.serverEntry],
@@ -466,11 +386,12 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 					detached: true,
 					env: {
 						...process.env,
-						...expectedEnv(config),
+						...expectedEnv(config, instanceId),
 					},
 					stdio: ["ignore", logFd, logFd],
 				})
 				spawnedPid = proc.pid
+				spawnedIdentity = processIdentity(proc.pid)
 				proc.unref()
 			} finally {
 				fs.closeSync(logFd)
@@ -480,7 +401,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 				throw new Error("Daemon failed to spawn.")
 			}
 
-			const health = await waitForHealthy(spawnedPid, logOffset)
+			const health = await waitForHealthy(spawnedPid, instanceId)
 			return {
 				running: true,
 				managed: true,
@@ -499,7 +420,17 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			}
 		} catch (error) {
 			if (spawnedPid !== null) {
-				await stopPid(spawnedPid).catch(() => undefined)
+				const entry = readRegistryEntry()
+				if (entry?.pid === spawnedPid) {
+					await stopPid(entry).catch(() => undefined)
+				} else if (spawnedIdentity && processIdentity(spawnedPid) === spawnedIdentity) {
+					try { process.kill(spawnedPid, "SIGTERM") } catch { /* already exited */ }
+					const deadline = Date.now() + gracefulStopTimeoutMs
+					while (Date.now() < deadline && processIdentity(spawnedPid) === spawnedIdentity) await sleep(POLL_INTERVAL_MS)
+					if (processIdentity(spawnedPid) === spawnedIdentity) {
+						try { process.kill(spawnedPid, "SIGKILL") } catch { /* already exited */ }
+					}
+				}
 			}
 			throw error
 		} finally {
@@ -513,7 +444,9 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		if (status.service !== null && status.service !== MOTEL_SERVICE_ID) {
 			throw new Error(`Refusing to stop non-motel service ${status.service} on ${status.url}.`)
 		}
-		await stopPid(status.pid)
+		const entry = readRegistryEntry()
+		if (!entry || entry.pid !== status.pid) throw new Error(`Refusing to stop pid ${status.pid}: no matching managed registry entry.`)
+		await stopPid(entry)
 		return await getStatus()
 	}
 

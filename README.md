@@ -66,6 +66,16 @@ Motel keeps everything in a machine-global local SQLite database at
 `${XDG_STATE_HOME:-~/.local/state}/motel/telemetry.sqlite`. One managed
 daemon is shared across local projects. No Docker, no cloud account.
 
+The store retains seven days of telemetry by default and targets a 1 GB
+active-data ceiling using bounded background batches. Recent data is preserved while
+the oldest completed traces and logs are removed first. Configure the policy
+with `MOTEL_OTEL_RETENTION_HOURS`, `MOTEL_OTEL_MAX_DB_SIZE_MB`,
+`MOTEL_OTEL_RETENTION_TRACE_BATCH`, `MOTEL_OTEL_RETENTION_LOG_BATCH`, and
+`MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`. Existing databases created without
+incremental auto-vacuum are never silently rewritten at startup; deleted pages
+are reused, but shrinking such a historical file requires an explicit offline
+SQLite `VACUUM` chosen by the user.
+
 ## How agents connect
 
 Agents with the `motel-debug` skill installed will automatically use

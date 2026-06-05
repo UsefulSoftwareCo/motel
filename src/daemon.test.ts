@@ -18,7 +18,7 @@ interface Harness {
 	readonly manager: ReturnType<typeof createDaemonManager>
 }
 
-const makeHarness = (): Harness => {
+const makeHarness = (options: { readonly startTimeoutMs?: number; readonly gracefulStopTimeoutMs?: number; readonly forceStopTimeoutMs?: number } = {}): Harness => {
 	const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-test-"))
 	const port = randomPort()
 	const databasePath = path.join(runtimeDir, "telemetry.sqlite")
@@ -27,6 +27,7 @@ const makeHarness = (): Harness => {
 		runtimeDir,
 		databasePath,
 		port,
+		...options,
 	})
 	return { runtimeDir, port, databasePath, manager }
 }
@@ -91,13 +92,7 @@ afterEach(async () => {
 })
 
 describe("daemon manager", () => {
-	test("warm-start via registry is fast even when HTTP health is slow", async () => {
-		// The failure mode we're preventing: a fully-healthy motel daemon
-		// is alive for our cwd, but its /api/health response queues
-		// behind heavy OTLP ingest traffic and takes >1s (seen on this
-		// machine: /api/health taking 4s under real load). With an
-		// HTTP-only probe the TUI would stall for seconds on every
-		// launch; the registry-based fast path should close in <100ms.
+	test("does not report a registry-only daemon as healthy", async () => {
 		const harness = makeHarness()
 		activeHarnesses.push(harness)
 
@@ -106,13 +101,11 @@ describe("daemon manager", () => {
 		const registryRoot = path.join(harness.runtimeDir, "state")
 		const originalXdg = process.env.XDG_STATE_HOME
 		process.env.XDG_STATE_HOME = registryRoot
-		const registryInstancesDir = path.join(registryRoot, "motel", "instances")
+		const registryInstancesDir = path.join(harness.runtimeDir, "instances")
 		fs.mkdirSync(registryInstancesDir, { recursive: true })
 
-		// Seed an entry that points at THIS test process. It's alive
-		// (we're executing), so isAlive(pid) will report true — the
-		// supervisor's fast path will adopt without ever issuing an
-		// HTTP request.
+		// Seed an alive registry entry whose HTTP listener cannot answer
+		// within the health deadline. PID liveness must not imply readiness.
 		const entryPath = path.join(registryInstancesDir, `${process.pid}.json`)
 		fs.writeFileSync(entryPath, JSON.stringify({
 			pid: process.pid,
@@ -123,9 +116,6 @@ describe("daemon manager", () => {
 			databasePath: harness.databasePath,
 		}), "utf8")
 
-		// Park a real-but-slow listener on the port. If the supervisor
-		// ever falls back to HTTP we'd wait out the 5s delay; a passing
-		// test proves the fast path took over.
 		const fake = startFakeDaemon({
 			port: harness.port,
 			databasePath: harness.databasePath,
@@ -134,15 +124,13 @@ describe("daemon manager", () => {
 
 		try {
 			const start = performance.now()
-			const status = await Effect.runPromise(harness.manager.ensure)
+			const status = await Effect.runPromise(harness.manager.getStatus)
 			const elapsed = performance.now() - start
-			expect(status.running).toBe(true)
-			expect(status.managed).toBe(true)
+			expect(status.running).toBe(false)
+			expect(status.managed).toBe(false)
 			expect(status.pid).toBe(process.pid)
-			// Generous — real-world is <10ms. Primarily guarding against
-			// a future regression that silently reintroduces an HTTP probe
-			// on the hot path.
-			expect(elapsed).toBeLessThan(500)
+			expect(elapsed).toBeGreaterThan(500)
+			expect(elapsed).toBeLessThan(2_000)
 		} finally {
 			fake.stop()
 			fs.rmSync(entryPath, { force: true })
@@ -151,18 +139,7 @@ describe("daemon manager", () => {
 		}
 	})
 
-	test("adopts a slow-to-respond healthy daemon instead of spawning a duplicate", async () => {
-		// Reproduces the `bun dev` EADDRINUSE flake. A real daemon is alive
-		// and holds the port, but its /api/health response takes longer
-		// than the supervisor's 750ms fetch timeout (e.g. the daemon is
-		// backfilling FTS or the SQLite writer lock is held). The buggy
-		// behaviour: supervisor thinks the port is free, spawns a fresh
-		// daemon child, the child tries to bind() → EADDRINUSE → child
-		// exits → supervisor throws "exited before becoming healthy".
-		//
-		// Correct behaviour: supervisor retries the health probe with a
-		// longer budget before declaring the port empty, finds the
-		// (slow) healthy motel on it, and adopts.
+	test("refuses to adopt a responsive but unmanaged motel server", async () => {
 		const harness = makeHarness()
 		activeHarnesses.push(harness)
 		const fake = startFakeDaemon({
@@ -171,11 +148,7 @@ describe("daemon manager", () => {
 			delayMs: 1_500,
 		})
 		try {
-			const status = await Effect.runPromise(harness.manager.ensure)
-			expect(status.running).toBe(true)
-			expect(status.managed).toBe(true)
-			// PID belongs to the fake test server, not a newly-spawned daemon.
-			expect(status.pid).toBe(process.pid)
+			await expect(Effect.runPromise(harness.manager.ensure)).rejects.toThrow("not an identity-verified managed daemon")
 		} finally {
 			fake.stop()
 		}
@@ -187,7 +160,7 @@ describe("daemon manager", () => {
 		const stateRoot = path.join(harness.runtimeDir, "legacy-state")
 		const originalXdg = process.env.XDG_STATE_HOME
 		process.env.XDG_STATE_HOME = stateRoot
-		const instancesDir = path.join(stateRoot, "motel", "instances")
+		const instancesDir = path.join(harness.runtimeDir, "instances")
 		fs.mkdirSync(instancesDir, { recursive: true })
 		const entryPath = path.join(instancesDir, `${process.pid}.json`)
 		fs.writeFileSync(entryPath, JSON.stringify({
@@ -242,7 +215,7 @@ describe("daemon manager", () => {
 		expect(finalStatus.running).toBe(false)
 	})
 
-	test("becomes healthy even if trace summary rebuild hits a write lock", async () => {
+	test("health responds while ingest readiness waits for a write lock", async () => {
 		const harness = makeHarness()
 		activeHarnesses.push(harness)
 
@@ -252,18 +225,219 @@ describe("daemon manager", () => {
 
 		const locker = new Database(harness.databasePath)
 		locker.exec("BEGIN IMMEDIATE")
+		let settled = false
+		const restarting = Effect.runPromise(harness.manager.ensure).then((status) => {
+			settled = true
+			return status
+		})
 		try {
 			const startedAt = performance.now()
-			const restarted = await Effect.runPromise(harness.manager.ensure)
+			let response: Response | null = null
+			while (performance.now() - startedAt < 2_000 && !response?.ok) {
+				response = await fetch(`http://127.0.0.1:${harness.port}/api/health`, { signal: AbortSignal.timeout(250) }).catch(() => null)
+			}
 			const elapsed = performance.now() - startedAt
-			expect(restarted.running).toBe(true)
-			expect(restarted.managed).toBe(true)
-			expect(elapsed).toBeLessThan(10_000)
+			expect(response?.ok).toBe(true)
+			expect(elapsed).toBeLessThan(2_000)
+			expect(settled).toBe(false)
 		} finally {
 			locker.exec("ROLLBACK")
 			locker.close()
 		}
+		const restarted = await restarting
+		expect(restarted.running).toBe(true)
 	}, 20_000)
+
+	test("force-kills an identity-verified daemon that ignores graceful shutdown", async () => {
+		const harness = makeHarness({ gracefulStopTimeoutMs: 250, forceStopTimeoutMs: 1_000 })
+		activeHarnesses.push(harness)
+		const started = await Effect.runPromise(harness.manager.ensure)
+		if (started.pid === null) throw new Error("Expected managed daemon pid")
+		process.kill(started.pid, "SIGSTOP")
+
+		const startedAt = performance.now()
+		const stopped = await Effect.runPromise(harness.manager.stop)
+		expect(stopped.running).toBe(false)
+		expect(performance.now() - startedAt).toBeLessThan(2_000)
+	})
+
+	test("does not write response logs for ingest endpoints", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		await Effect.runPromise(harness.manager.ensure)
+		for (let index = 0; index < 10; index++) {
+			await fetch(`http://127.0.0.1:${harness.port}/v1/logs`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+			})
+		}
+		await fetch(`http://127.0.0.1:${harness.port}/api/services`)
+		await Bun.sleep(100)
+		const log = fs.readFileSync(path.join(harness.runtimeDir, "daemon.log"), "utf8")
+		expect(log).not.toContain("/v1/logs")
+		expect(log).toContain("/api/services")
+	})
+
+	test("repeated ingest does not recursively create Motel telemetry", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		await Effect.runPromise(harness.manager.ensure)
+		const nowNanos = String(BigInt(Date.now()) * 1_000_000n)
+		const payload = JSON.stringify({
+			resourceLogs: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "recursion-fixture" } }] },
+				scopeLogs: [{ logRecords: [{ timeUnixNano: nowNanos, body: { stringValue: "one source log" } }] }],
+			}],
+		})
+		for (let index = 0; index < 10; index++) {
+			await fetch(`http://127.0.0.1:${harness.port}/v1/logs`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: index === 0 ? payload : "{}",
+			})
+		}
+		await Bun.sleep(250)
+		const probe = new Database(harness.databasePath, { readonly: true })
+		try {
+			const total = (probe.query(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c
+			const motel = (probe.query(`SELECT COUNT(*) AS c FROM logs WHERE service_name = 'motel-otel-tui'`).get() as { c: number }).c
+			expect(total).toBe(1)
+			expect(motel).toBe(0)
+		} finally {
+			probe.close()
+		}
+	})
+
+	test("large retained schema maintenance cannot block health", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		await Effect.runPromise(harness.manager.ensure)
+		await Effect.runPromise(harness.manager.stop)
+
+		const fixture = new Database(harness.databasePath)
+		fixture.exec(`DROP INDEX IF EXISTS idx_spans_service_time; DROP INDEX IF EXISTS idx_spans_trace_time; DROP INDEX IF EXISTS idx_spans_span_id; DROP INDEX IF EXISTS idx_spans_status_time; BEGIN`)
+		const insert = fixture.query(`INSERT INTO spans VALUES (?, ?, NULL, 'large-fixture', NULL, 'op', NULL, ?, ?, 1, 'ok', ?, '{}', '[]')`)
+		const blob = JSON.stringify({ blob: "x".repeat(512) })
+		for (let index = 0; index < 50_000; index++) insert.run(`large-trace-${index}`, `large-span-${index}`, index, index + 1, blob)
+		fixture.exec(`COMMIT; PRAGMA wal_checkpoint(TRUNCATE)`)
+		fixture.close()
+
+		const startedAt = performance.now()
+		const restarting = Effect.runPromise(harness.manager.ensure)
+		let response: Response | null = null
+		while (performance.now() - startedAt < 1_500 && !response?.ok) {
+			response = await fetch(`http://127.0.0.1:${harness.port}/api/health`, { signal: AbortSignal.timeout(200) }).catch(() => null)
+		}
+		expect(response?.ok).toBe(true)
+		expect(performance.now() - startedAt).toBeLessThan(1_500)
+		const restarted = await restarting
+		expect(restarted.running).toBe(true)
+	}, 30_000)
+
+	test("an expensive retained-database query cannot block health", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		await Effect.runPromise(harness.manager.ensure)
+		await Effect.runPromise(harness.manager.stop)
+
+		const fixture = new Database(harness.databasePath)
+		const insert = fixture.query(`INSERT INTO trace_summaries VALUES (?, 'query-pressure', 'op', ?, ?, 0, ?, 1, 0)`)
+		const now = Date.now()
+		fixture.exec("BEGIN")
+		for (let index = 0; index < 500_000; index++) insert.run(`query-trace-${index}`, now - index, now - index + 1, index % 1_000)
+		fixture.exec(`COMMIT; PRAGMA wal_checkpoint(TRUNCATE)`)
+		fixture.close()
+		await Effect.runPromise(harness.manager.ensure)
+
+		const query = fetch(`http://127.0.0.1:${harness.port}/api/traces/stats?groupBy=service&agg=p95_duration&lookback=1440`)
+		await Bun.sleep(5)
+		const healthStartedAt = performance.now()
+		const health = await fetch(`http://127.0.0.1:${harness.port}/api/health`, { signal: AbortSignal.timeout(250) })
+		expect(health.ok).toBe(true)
+		expect(performance.now() - healthStartedAt).toBeLessThan(250)
+		expect((await query).ok).toBe(true)
+	}, 30_000)
+
+	test("configured size retention evicts oldest logs first", async () => {
+		const previousMax = process.env.MOTEL_OTEL_MAX_DB_SIZE_MB
+		const previousBatch = process.env.MOTEL_OTEL_RETENTION_LOG_BATCH
+		const previousInterval = process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS
+		process.env.MOTEL_OTEL_MAX_DB_SIZE_MB = "3"
+		process.env.MOTEL_OTEL_RETENTION_LOG_BATCH = "2"
+		process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS = "1"
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		try {
+			await Effect.runPromise(harness.manager.ensure)
+			const baseNanos = BigInt(Date.now()) * 1_000_000n
+			for (let index = 0; index < 10; index++) {
+				const payload = JSON.stringify({
+					resourceLogs: [{
+						resource: { attributes: [{ key: "service.name", value: { stringValue: "size-retention" } }] },
+						scopeLogs: [{ logRecords: [{
+							timeUnixNano: String(baseNanos + BigInt(index)),
+							body: { stringValue: `retention-${index}-${String(index).repeat(300_000)}` },
+						}] }],
+					}],
+				})
+				await fetch(`http://127.0.0.1:${harness.port}/v1/logs`, { method: "POST", headers: { "content-type": "application/json" }, body: payload })
+			}
+
+			let bodies: string[] = []
+			const deadline = Date.now() + 6_000
+			while (Date.now() < deadline) {
+				const probe = new Database(harness.databasePath, { readonly: true })
+				try {
+					bodies = (probe.query(`SELECT body FROM logs WHERE service_name = 'size-retention' ORDER BY timestamp_ms ASC, id ASC`).all() as Array<{ body: string }>).map((row) => row.body)
+				} finally {
+					probe.close()
+				}
+				if (bodies.length < 10) break
+				await Bun.sleep(200)
+			}
+			expect(bodies.length).toBeLessThan(10)
+			expect(bodies.some((body) => body.startsWith("retention-0-"))).toBe(false)
+			expect(bodies.some((body) => body.startsWith("retention-9-"))).toBe(true)
+		} finally {
+			await Effect.runPromise(harness.manager.stop).catch(() => undefined)
+			if (previousMax === undefined) delete process.env.MOTEL_OTEL_MAX_DB_SIZE_MB
+			else process.env.MOTEL_OTEL_MAX_DB_SIZE_MB = previousMax
+			if (previousBatch === undefined) delete process.env.MOTEL_OTEL_RETENTION_LOG_BATCH
+			else process.env.MOTEL_OTEL_RETENTION_LOG_BATCH = previousBatch
+			if (previousInterval === undefined) delete process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS
+			else process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS = previousInterval
+		}
+	}, 20_000)
+
+	test("cleans a stale registry pid identity without signaling it", async () => {
+		const harness = makeHarness({ gracefulStopTimeoutMs: 100, forceStopTimeoutMs: 100 })
+		activeHarnesses.push(harness)
+		const sentinel = Bun.spawn({ cmd: [process.execPath, "-e", "setInterval(() => {}, 1000)"], stdout: "ignore", stderr: "ignore" })
+		await Bun.sleep(50)
+		const instances = path.join(harness.runtimeDir, "instances")
+		fs.mkdirSync(instances, { recursive: true })
+		fs.writeFileSync(path.join(instances, `${sentinel.pid}.json`), JSON.stringify({
+			pid: sentinel.pid,
+			url: `http://127.0.0.1:${harness.port}`,
+			workdir: process.cwd(),
+			startedAt: new Date().toISOString(),
+			version: "test",
+			databasePath: harness.databasePath,
+			instanceId: "stale-instance",
+			processIdentity: "stale-process",
+		}), "utf8")
+
+		try {
+			const stopped = await Effect.runPromise(harness.manager.stop)
+			expect(stopped.running).toBe(false)
+			expect(fs.existsSync(path.join(instances, `${sentinel.pid}.json`))).toBe(false)
+			expect(sentinel.exitCode).toBeNull()
+		} finally {
+			sentinel.kill("SIGKILL")
+			await sentinel.exited
+		}
+	})
 
 	test("uses the shared global state dir regardless of caller cwd", async () => {
 		const projectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "motel-daemon-project-")))

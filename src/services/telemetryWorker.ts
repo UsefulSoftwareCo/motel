@@ -6,15 +6,12 @@
  * evaluated in a FRESH module graph on the worker side. In particular
  * `TelemetryStoreWorkerLive` opens its own SQLite connection here — the main
  * thread's store connection is unrelated. SQLite's WAL journal mode
- * lets both connections coexist against the same `.sqlite` file: the
- * worker writes, the main thread reads, and neither blocks the other.
+ * lets writer and query-worker connections coexist against the same
+ * `.sqlite` file without blocking the HTTP event loop.
  *
- * The worker only exposes `ingestTraces` / `ingestLogs` (see
- * ingestRpc.ts). Query methods stay on the main thread because they're
- * already fast (1-14ms) and round-tripping them through structured-
- * clone would add more overhead than it saves. This is a deliberately
- * narrow interface — the payoff is that main-thread HTTP queries
- * never queue behind a heavy OTLP batch again.
+ * The worker exposes only `ingestTraces` / `ingestLogs` (see ingestRpc.ts)
+ * and owns writer maintenance. Read queries run in telemetryQueryWorker.ts;
+ * neither path can block the HTTP event loop.
  */
 
 import { BunRuntime } from "@effect/platform-bun"

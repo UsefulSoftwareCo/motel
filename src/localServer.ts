@@ -9,9 +9,10 @@ import * as HttpStaticServer from "effect/unstable/http/HttpStaticServer"
 import * as BunHttpServer from "@effect/platform-bun/BunHttpServer"
 import { MotelHttpApi } from "./httpApi.js"
 import { AI_LIST, LOG_LIST, LOG_STATS, SPAN_LIST, TRACE_LIST, TRACE_STATS, listMeta, logCursorArgs, paginateLogs, paginateSummaries, parseLimit, parseListParams as decodeListParams, parseLookbackMinutes, requestUrl as decodeRequestUrl, traceCursorArgs, type ListBounds, type ListParams } from "./httpListPolicy.js"
-import { MOTEL_SERVICE_ID, MOTEL_VERSION, removeRegistryEntry, writeRegistryEntry } from "./registry.js"
+import { MOTEL_SERVICE_ID, MOTEL_VERSION, processIdentity, removeRegistryEntry, writeRegistryEntry } from "./registry.js"
 import { AsyncIngest, AsyncIngestLive } from "./services/AsyncIngest.js"
-import { TelemetryStoreLive, TelemetryStoreReadonly, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
+import { TelemetryStoreReadonly } from "./services/TelemetryStore.js"
+import { TelemetryQueryLive } from "./services/TelemetryQuery.js"
 import type { LogItem, TraceItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
 
@@ -19,7 +20,7 @@ import { lifecycleLabel } from "./ui/format.js"
 // Both /api/health and the registry entry read from here so they agree
 // on a single server-start timestamp, and the value reflects actual
 // listen time rather than module-evaluation time.
-let serverStartedAt: string = new Date(0).toISOString()
+let serverStartedAt: string = new Date().toISOString()
 
 const requestUrl = (request: { readonly url: string }) => decodeRequestUrl(request, config.otel.baseUrl)
 const parseListParams = (request: { readonly url: string }, bounds: ListBounds) => decodeListParams(request, bounds, config.otel.baseUrl)
@@ -28,6 +29,17 @@ const jsonResponse = (value: unknown, status = 200) => HttpServerResponse.jsonUn
 const textResponse = (value: string) => HttpServerResponse.text(value)
 const htmlResponse = (value: string) => HttpServerResponse.html(value)
 const notFoundResponse = (message = "Not found") => jsonResponse({ error: message }, 404)
+const healthPayload = () => ({
+	ok: true,
+	service: MOTEL_SERVICE_ID,
+	databasePath: config.otel.databasePath,
+	pid: process.pid,
+	url: config.otel.baseUrl,
+	workdir: process.cwd(),
+	startedAt: serverStartedAt,
+	version: MOTEL_VERSION,
+	instanceId: process.env.MOTEL_DAEMON_INSTANCE_ID?.trim(),
+})
 // Query handlers resolve against the readonly store identifier so they
 // don't contend with the writer connection that owns ingest/retention.
 const withRead = <A>(f: (store: TelemetryStoreReadonly["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TelemetryStoreReadonly.asEffect(), f)
@@ -160,40 +172,31 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 				Effect.succeed(textResponse("motel local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/facets?type=logs&field=severity\nGET /api/docs\nGET /api/docs/<name>\nGET /openapi.json\nGET /docs\nGET /trace/<trace-id>\n")),
 			)
 			.handle("health", () =>
-				Effect.succeed({
-					ok: true,
-					service: MOTEL_SERVICE_ID,
-					databasePath: config.otel.databasePath,
-					pid: process.pid,
-					url: config.otel.baseUrl,
-					workdir: process.cwd(),
-					startedAt: serverStartedAt,
-					version: MOTEL_VERSION,
-				}),
+				HttpMiddleware.withLoggerDisabled(Effect.succeed(healthPayload())),
 			)
 			// OTLP ingest is routed to the worker thread via AsyncIngest
 			// so the main event loop stays free during heavy SQLite writes.
-			// Everything else still uses the direct TelemetryStore — reads
-			// are fast enough that IPC overhead isn't worth paying.
+			// Read queries use a separate query worker so synchronous SQLite
+			// work cannot block the HTTP event loop.
 			.handleRaw("ingestTraces", ({ request }) =>
-				respondRaw(
+				HttpMiddleware.withLoggerDisabled(respondRaw(
 					Effect.flatMap(request.json, (payload) =>
 						Effect.map(
 							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),
-				),
+				)),
 			)
 			.handleRaw("ingestLogs", ({ request }) =>
-				respondRaw(
+				HttpMiddleware.withLoggerDisabled(respondRaw(
 					Effect.flatMap(request.json, (payload) =>
 						Effect.map(
 							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),
-				),
+				)),
 			)
 			.handleRaw("services", () => respondJson(Effect.map(withRead((store) => store.listServices), (data) => ({ data }))))
 			.handleRaw("traces", ({ request }) =>
@@ -490,6 +493,8 @@ const RegistryLayer = Layer.effectDiscard(
 					startedAt: serverStartedAt,
 					version: MOTEL_VERSION,
 					databasePath: config.otel.databasePath,
+					instanceId: process.env.MOTEL_DAEMON_INSTANCE_ID?.trim(),
+					processIdentity: processIdentity(process.pid) ?? undefined,
 				})
 			} catch (err) {
 				console.warn(`motel: failed to write registry entry: ${(err as Error).message}`)
@@ -527,18 +532,18 @@ export const ServerLive = HttpRouter.serve(
 	// POSTs again on the next flush. This also shaves ~1 KB of header
 	// attributes off every ingest request that would have been written
 	// to the spans table as noise.
-	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/v1/traces", "/v1/logs"])),
-	// AsyncIngest spawns the telemetry worker — keeps the main-thread
-	// event loop free during heavy SQLite writes. Provided alongside
-	// the writer TelemetryStore for ingest / maintenance. Query handlers
-	// resolve through TelemetryStoreReadonly so reads do not contend
-	// with the writer connection.
+	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/v1/traces", "/v1/logs"])),
+	// The telemetry worker owns ingest, migrations, and bounded maintenance.
+	// The HTTP thread only opens an existing database read-only (or bootstraps
+	// a brand-new empty one), keeping health independent of writer work.
 	Layer.provideMerge(AsyncIngestLive),
-	Layer.provideMerge(TelemetryStoreReadonlyLive),
-	Layer.provideMerge(TelemetryStoreLive),
+	Layer.provideMerge(TelemetryQueryLive),
 	Layer.provideMerge(BunHttpServer.layer({
 		port: config.otel.port,
 		hostname: config.otel.host,
 		reusePort: true,
+		routes: {
+			"/api/health": () => Response.json(healthPayload()),
+		},
 	})),
 )

@@ -93,6 +93,8 @@ const SERVICE_NAME = "sort-nav-repro"
 describe("trace navigation after changing sort", () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "motel-sort-repro-"))
 	const dbPath = join(tempDir, "telemetry.sqlite")
+	const port = 50_000 + Math.floor(Math.random() * 5_000)
+	const daemonEnv = { MOTEL_RUNTIME_DIR: tempDir, MOTEL_OTEL_DB_PATH: dbPath, MOTEL_OTEL_BASE_URL: `http://127.0.0.1:${port}`, MOTEL_OTEL_QUERY_URL: `http://127.0.0.1:${port}`, MOTEL_OTEL_PORT: String(port) }
 	const lastServicePath = join(tempDir, "last-service.txt")
 	let canRun = false
 
@@ -106,7 +108,7 @@ describe("trace navigation after changing sort", () => {
 		const seed = Bun.spawn({
 			cmd: ["bun", "run", "src/ui/traceSortNav.repro.seed.ts"],
 			cwd: process.cwd(),
-			env: { ...process.env, MOTEL_OTEL_DB_PATH: dbPath, MOTEL_OTEL_ENABLED: "false" },
+			env: { ...process.env, ...daemonEnv, MOTEL_OTEL_ENABLED: "false" },
 			stdout: "pipe",
 			stderr: "pipe",
 		})
@@ -128,6 +130,10 @@ describe("trace navigation after changing sort", () => {
 			"--rows", "20",
 			"--cwd", process.cwd(),
 			"--env", `MOTEL_OTEL_DB_PATH=${dbPath}`,
+			"--env", `MOTEL_RUNTIME_DIR=${tempDir}`,
+			"--env", `MOTEL_OTEL_BASE_URL=${daemonEnv.MOTEL_OTEL_BASE_URL}`,
+			"--env", `MOTEL_OTEL_QUERY_URL=${daemonEnv.MOTEL_OTEL_QUERY_URL}`,
+			"--env", `MOTEL_OTEL_PORT=${port}`,
 			"--env", "MOTEL_OTEL_ENABLED=false",
 			"--timeout", "15000",
 		])
@@ -137,7 +143,11 @@ describe("trace navigation after changing sort", () => {
 	}, 60_000)
 
 	afterAll(async () => {
-		if (canRun) await tui(["close", "--session", SESSION])
+		if (canRun) {
+			await tui(["close", "--session", SESSION])
+			const stop = Bun.spawn({ cmd: ["bun", "run", "src/motel.ts", "stop"], cwd: process.cwd(), env: { ...process.env, ...daemonEnv }, stdout: "ignore", stderr: "ignore" })
+			await stop.exited
+		}
 		try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
 	})
 

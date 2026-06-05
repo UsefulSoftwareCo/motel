@@ -20,7 +20,7 @@
  */
 
 import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Context, Duration, Effect, Layer, Scope } from "effect"
+import { Context, Duration, Effect, Exit, Layer, Scope } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
@@ -56,21 +56,27 @@ export const AsyncIngestLive = Layer.effect(
 		// bootstrap. Cache a lazy initializer instead so the worker only starts
 		// on the first ingest request, but is still shared thereafter.
 		const [getClient, invalidateClient] = yield* Effect.cachedInvalidateWithTTL(Effect.gen(function*() {
-			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, scope)
-			return yield* RpcClient.make(IngestRpcs).pipe(
+			const clientScope = yield* Scope.fork(scope, "sequential")
+			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
+			const client = yield* RpcClient.make(IngestRpcs).pipe(
 				Effect.provide(protocolContext),
-				Effect.provideService(Scope.Scope, scope),
+				Effect.provideService(Scope.Scope, clientScope),
 			)
+			return { client, clientScope }
 		}), Duration.infinity)
+		// Start the sole writer/maintenance worker immediately, but do not make
+		// HTTP health wait for SQLite bootstrap. Managed readiness still verifies
+		// the worker through explicit ingest probes.
+		yield* Effect.forkScoped(getClient.pipe(Effect.ignore))
 		return {
 			ingestTraces: (input, options) =>
-				Effect.flatMap(getClient, (client) => client.ingestTraces(input, options)).pipe(
-					Effect.onError(() => invalidateClient),
-				),
+				Effect.flatMap(getClient, ({ client, clientScope }) => client.ingestTraces(input, options).pipe(
+					Effect.onError(() => Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)),
+				)),
 			ingestLogs: (input, options) =>
-				Effect.flatMap(getClient, (client) => client.ingestLogs(input, options)).pipe(
-					Effect.onError(() => invalidateClient),
-				),
+				Effect.flatMap(getClient, ({ client, clientScope }) => client.ingestLogs(input, options).pipe(
+					Effect.onError(() => Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)),
+				)),
 		}
 	}),
 )

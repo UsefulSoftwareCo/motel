@@ -9,6 +9,8 @@ import { attributeFiltersFromArgs, attributeContainsFiltersFromArgs, isAttribute
 describe("motel telemetry store", () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "motel-test-"))
 	const dbPath = join(tempDir, "telemetry.sqlite")
+	const previousDatabasePath = process.env.MOTEL_OTEL_DB_PATH
+	const previousRetentionHours = process.env.MOTEL_OTEL_RETENTION_HOURS
 	let storeRuntime: Awaited<typeof import("./runtime.ts")>["storeRuntime"]
 	let TelemetryStore: Awaited<typeof import("./services/TelemetryStore.ts")>["TelemetryStore"]
 	let motelOpenApiSpec: Awaited<typeof import("./httpApi.ts")>["motelOpenApiSpec"]
@@ -220,8 +222,13 @@ describe("motel telemetry store", () => {
 		await storeRuntime.runPromise(ingest.pipe(Effect.provideService(References.MinimumLogLevel, "None")))
 	})
 
-	afterAll(() => {
+	afterAll(async () => {
+		await storeRuntime.dispose()
 		rmSync(tempDir, { recursive: true, force: true })
+		if (previousDatabasePath === undefined) delete process.env.MOTEL_OTEL_DB_PATH
+		else process.env.MOTEL_OTEL_DB_PATH = previousDatabasePath
+		if (previousRetentionHours === undefined) delete process.env.MOTEL_OTEL_RETENTION_HOURS
+		else process.env.MOTEL_OTEL_RETENTION_HOURS = previousRetentionHours
 	})
 
 	it("creates fresh DBs with auto_vacuum=INCREMENTAL", () => {
@@ -286,6 +293,113 @@ describe("motel telemetry store", () => {
 			const freelistAfter = (probe.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
 			expect(pageCountAfter).toBeLessThan(pageCountBefore)
 			expect(freelistAfter).toBeLessThan(freelistAfterDelete)
+		} finally {
+			probe.close()
+		}
+	})
+
+	it("retention prunes old correlated orphan logs and preserves recent logs", async () => {
+		const oldNanos = BigInt(Date.now() - 48 * 60 * 60 * 1000) * 1_000_000n
+		const recentNanos = BigInt(Date.now()) * 1_000_000n
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore.asEffect(), (store) =>
+				Effect.andThen(
+					store.ingestLogs({
+						resourceLogs: [{
+							resource: { attributes: [{ key: "service.name", value: { stringValue: "retention-test" } }] },
+							scopeLogs: [{ logRecords: [{ traceId: "missing-old-trace", timeUnixNano: String(oldNanos), body: { stringValue: "expired-correlated-log" } }, { traceId: "missing-recent-trace", timeUnixNano: String(recentNanos), body: { stringValue: "recent-correlated-log" } }] }],
+						}],
+					}),
+					store.runRetentionNow,
+				),
+			).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		const probe = new Database(dbPath, { readonly: true })
+		try {
+			const oldCount = (probe.query(`SELECT COUNT(*) AS c FROM logs WHERE body = 'expired-correlated-log'`).get() as { c: number }).c
+			const recentCount = (probe.query(`SELECT COUNT(*) AS c FROM logs WHERE body = 'recent-correlated-log'`).get() as { c: number }).c
+			expect(oldCount).toBe(0)
+			expect(recentCount).toBe(1)
+		} finally {
+			probe.close()
+		}
+	})
+
+	it("retention cleans orphan log indexes even when no logs are deleted", async () => {
+		const probe = new Database(dbPath)
+		try {
+			probe.query(`INSERT INTO log_attributes(log_id, key, value) VALUES (?, 'orphan', 'value')`).run(9_999_999)
+			probe.query(`INSERT INTO log_body_fts(log_id, body) VALUES (?, 'orphan body')`).run("9999999")
+		} finally {
+			probe.close()
+		}
+
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore.asEffect(), (store) => store.runRetentionNow).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+
+		const check = new Database(dbPath, { readonly: true })
+		try {
+			expect((check.query(`SELECT COUNT(*) AS c FROM log_attributes WHERE log_id = 9999999`).get() as { c: number }).c).toBe(0)
+			expect((check.query(`SELECT COUNT(*) AS c FROM log_body_fts WHERE log_id = '9999999'`).get() as { c: number }).c).toBe(0)
+		} finally {
+			check.close()
+		}
+	})
+
+	it("does not rewrite legacy auto_vacuum databases on startup", async () => {
+		const legacyPath = join(tempDir, "legacy-no-vacuum.sqlite")
+		const legacy = new Database(legacyPath)
+		legacy.exec(`PRAGMA auto_vacuum = NONE; CREATE TABLE legacy(value TEXT); INSERT INTO legacy VALUES ('kept');`)
+		legacy.close()
+
+		const open = Bun.spawn({
+			cmd: [process.execPath, "-e", `const { Effect } = await import('effect'); const { storeRuntime } = await import('./src/runtime.ts'); const { TelemetryStore } = await import('./src/services/TelemetryStore.ts'); await storeRuntime.runPromise(Effect.flatMap(TelemetryStore.asEffect(), (store) => store.listServices)); await storeRuntime.dispose()`],
+			cwd: process.cwd(),
+			env: { ...process.env, MOTEL_OTEL_DB_PATH: legacyPath },
+			stdout: "ignore",
+			stderr: "pipe",
+		})
+		expect(await open.exited).toBe(0)
+
+		const probe = new Database(legacyPath, { readonly: true })
+		try {
+			expect((probe.query(`PRAGMA auto_vacuum`).get() as { auto_vacuum: number }).auto_vacuum).toBe(0)
+			expect((probe.query(`SELECT value FROM legacy`).get() as { value: string }).value).toBe("kept")
+		} finally {
+			probe.close()
+		}
+	})
+
+	it("incrementally backfills historical AI FTS content", async () => {
+		const historicalPath = join(tempDir, "historical-fts.sqlite")
+		const seedScript = `
+			const { Effect } = await import('effect')
+			const { storeRuntime } = await import('./src/runtime.ts')
+			const { TelemetryStore } = await import('./src/services/TelemetryStore.ts')
+			await storeRuntime.runPromise(Effect.flatMap(TelemetryStore.asEffect(), (store) => store.ingestTraces({ resourceSpans: [{ resource: { attributes: [{ key: 'service.name', value: { stringValue: 'historical-fts' } }] }, scopeSpans: [{ spans: [{ traceId: 'historical-trace', spanId: 'historical-span', name: 'ai.generateText', startTimeUnixNano: '1', endTimeUnixNano: '2', attributes: [{ key: 'ai.response.text', value: { stringValue: 'historical-backfill-token' } }] }] }] }] })))
+			await storeRuntime.dispose()
+		`
+		const seed = Bun.spawn({ cmd: [process.execPath, "-e", seedScript], cwd: process.cwd(), env: { ...process.env, MOTEL_OTEL_DB_PATH: historicalPath }, stdout: "ignore", stderr: "pipe" })
+		expect(await seed.exited).toBe(0)
+
+		const damage = new Database(historicalPath)
+		damage.query(`INSERT INTO span_attr_fts(span_attr_fts) VALUES ('delete-all')`).run()
+		damage.query(`DELETE FROM motel_maintenance WHERE key = 'span_attr_fts_v1'`).run()
+		damage.close()
+
+		const repair = Bun.spawn({ cmd: [process.execPath, "-e", `const { Effect } = await import('effect'); const { storeRuntime } = await import('./src/runtime.ts'); const { TelemetryStore } = await import('./src/services/TelemetryStore.ts'); await storeRuntime.runPromise(Effect.flatMap(TelemetryStore.asEffect(), (store) => store.listServices)); await Bun.sleep(500); await storeRuntime.dispose()`], cwd: process.cwd(), env: { ...process.env, MOTEL_OTEL_DB_PATH: historicalPath }, stdout: "ignore", stderr: "pipe" })
+		expect(await repair.exited).toBe(0)
+
+		const probe = new Database(historicalPath, { readonly: true })
+		try {
+			const match = (probe.query(`SELECT COUNT(*) AS c FROM span_attr_fts WHERE span_attr_fts MATCH 'historical'`).get() as { c: number }).c
+			const marker = (probe.query(`SELECT value FROM motel_maintenance WHERE key = 'span_attr_fts_v1'`).get() as { value: string }).value
+			expect(match).toBe(1)
+			expect(marker).toBe("complete")
 		} finally {
 			probe.close()
 		}

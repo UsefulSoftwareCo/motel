@@ -14,9 +14,9 @@ const stateHome = () =>
  * One motel daemon serves every project on this machine — there is no
  * per-cwd state.
  */
-export const motelStateDir = () => path.join(stateHome(), "motel")
+export const motelStateDir = () => process.env.MOTEL_RUNTIME_DIR?.trim() || path.join(stateHome(), "motel")
 
-export const registryDir = () => path.join(motelStateDir(), "instances")
+export const registryDir = (runtimeDir = motelStateDir()) => path.join(runtimeDir, "instances")
 
 export type RegistryEntry = {
 	readonly pid: number
@@ -24,6 +24,8 @@ export type RegistryEntry = {
 	readonly workdir: string
 	readonly startedAt: string
 	readonly version: string
+	readonly instanceId?: string
+	readonly processIdentity?: string
 	/**
 	 * The SQLite database path the daemon is serving. Optional because
 	 * older daemon builds omit it; consumers should treat a missing
@@ -34,7 +36,7 @@ export type RegistryEntry = {
 	readonly databasePath?: string
 }
 
-const entryPath = (pid: number) => path.join(registryDir(), `${pid}.json`)
+const entryPath = (pid: number, runtimeDir = motelStateDir()) => path.join(registryDir(runtimeDir), `${pid}.json`)
 
 export const isAlive = (pid: number): boolean => {
 	try {
@@ -45,8 +47,23 @@ export const isAlive = (pid: number): boolean => {
 	}
 }
 
-export const listAliveEntries = (): RegistryEntry[] => {
-	const dir = registryDir()
+export const processIdentity = (pid: number): string | null => {
+	try {
+		const result = Bun.spawnSync({ cmd: ["ps", "-p", String(pid), "-o", "lstart="] })
+		if (result.exitCode !== 0) return null
+		const identity = result.stdout.toString().trim()
+		return identity.length > 0 ? identity : null
+	} catch {
+		return null
+	}
+}
+
+export const isManagedDaemonProcess = (entry: RegistryEntry): boolean => {
+	return Boolean(entry.instanceId && entry.processIdentity && processIdentity(entry.pid) === entry.processIdentity)
+}
+
+export const listAliveEntries = (runtimeDir = motelStateDir()): RegistryEntry[] => {
+	const dir = registryDir(runtimeDir)
 	let files: string[]
 	try {
 		files = fs.readdirSync(dir)
@@ -59,7 +76,7 @@ export const listAliveEntries = (): RegistryEntry[] => {
 		const full = path.join(dir, f)
 		try {
 			const entry = JSON.parse(fs.readFileSync(full, "utf8")) as RegistryEntry
-			if (isAlive(entry.pid)) {
+			if (entry.instanceId && entry.processIdentity ? isManagedDaemonProcess(entry) : isAlive(entry.pid)) {
 				alive.push(entry)
 			} else {
 				try { fs.unlinkSync(full) } catch {}
@@ -71,9 +88,9 @@ export const listAliveEntries = (): RegistryEntry[] => {
 	return alive
 }
 
-export const writeRegistryEntry = (entry: RegistryEntry) => {
-	fs.mkdirSync(registryDir(), { recursive: true })
-	const file = entryPath(entry.pid)
+export const writeRegistryEntry = (entry: RegistryEntry, runtimeDir = motelStateDir()) => {
+	fs.mkdirSync(registryDir(runtimeDir), { recursive: true })
+	const file = entryPath(entry.pid, runtimeDir)
 	fs.writeFileSync(file, JSON.stringify(entry, null, 2), "utf8")
 }
 
@@ -87,9 +104,9 @@ export const writeRegistryEntry = (entry: RegistryEntry) => {
  * server (via BunRuntime.runMain) now owns signal handling; registry
  * cleanup rides along on scope release.
  */
-export const removeRegistryEntry = (pid: number) => {
+export const removeRegistryEntry = (pid: number, runtimeDir = motelStateDir()) => {
 	try {
-		fs.unlinkSync(entryPath(pid))
+		fs.unlinkSync(entryPath(pid, runtimeDir))
 	} catch {
 		// Already gone — another cleanup path won the race, or the entry
 		// was never written.
