@@ -1,101 +1,101 @@
 {
-  "name": "@kitlangton/motel",
-  "version": "0.2.5",
-  "description": "A local OpenTelemetry ingest + TUI viewer for development, backed by SQLite.",
-  "type": "module",
-  "license": "MIT",
-  "author": "Kit Langton",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/kitlangton/motel.git"
-  },
-  "homepage": "https://github.com/kitlangton/motel#readme",
-  "bugs": {
-    "url": "https://github.com/kitlangton/motel/issues"
-  },
-  "keywords": [
-    "opentelemetry",
-    "otel",
-    "tracing",
-    "observability",
-    "tui",
-    "sqlite",
-    "effect",
-    "opentui"
-  ],
-  "workspaces": [
-    "web"
-  ],
-  "engines": {
-    "bun": ">=1.1.0"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "files": [
-    "src",
-    "web/dist",
-    "LICENSE",
-    "README.md",
-    "AGENTS.md"
-  ],
-  "bin": {
-    "motel": "src/motel.ts",
-    "motel-mcp": "src/mcp.ts"
-  },
-  "scripts": {
-    "clear-motel-debug": "bun run skills/motel-debug/scripts/clear-motel-debug.ts",
-    "dev": "MOTEL_OTEL_ENABLED=true bun run src/motel.ts tui",
-    "start": "bun run src/motel.ts tui",
-    "daemon": "bun run src/motel.ts daemon",
-    "status": "bun run src/motel.ts status",
-    "stop": "bun run src/motel.ts stop",
-    "restart": "bun run src/motel.ts restart",
-    "server": "bun run src/motel.ts server",
-    "mcp": "bun run src/mcp.ts",
-    "test": "bun test",
-    "cli": "bun run src/cli.ts",
-    "instructions": "bun run src/cli.ts instructions",
-    "services": "bun run src/cli.ts services",
-    "logs": "bun run src/cli.ts logs",
-    "trace-logs": "bun run src/cli.ts trace-logs",
-    "span-logs": "bun run src/cli.ts span-logs",
-    "span": "bun run src/cli.ts span",
-    "trace-spans": "bun run src/cli.ts trace-spans",
-    "search-spans": "bun run src/cli.ts search-spans",
-    "trace-stats": "bun run src/cli.ts trace-stats",
-    "log-stats": "bun run src/cli.ts log-stats",
-    "web:dev": "bun run --cwd web dev",
-    "web:build": "bun run --cwd web build",
-    "story:chat": "bun run src/storybook/aiChatStory.tsx",
-    "bench:motel-cold-start": "bun run scripts/bench-motel-cold-start.ts",
-    "bench:ingest-logs": "bun run scripts/bench-ingest-logs.ts",
-    "bench:ingest-traces": "bun run scripts/bench-ingest-traces.ts",
-    "bench:search-spans": "bun run scripts/bench-search-spans.ts",
-    "typecheck": "tsc --noEmit",
-    "prepublishOnly": "bun run web:build"
-  },
-  "devDependencies": {
-    "@effect/language-service": "^0.85.1",
-    "@types/bun": "^1.3.12",
-    "@types/react": "^19.2.14",
-    "typescript": "^6.0.2"
-  },
-  "dependencies": {
-    "@effect/atom-react": "^4.0.0-beta.49",
-    "@effect/opentelemetry": "^4.0.0-beta.49",
-    "@effect/platform-bun": "^4.0.0-beta.50",
-    "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/exporter-logs-otlp-http": "^0.214.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.211.0",
-    "@opentelemetry/sdk-logs": "^0.214.0",
-    "@opentelemetry/sdk-node": "^0.214.0",
-    "@opentelemetry/sdk-trace-base": "^2.5.0",
-    "@opentelemetry/sdk-trace-node": "^2.6.1",
-    "@opentui/core": "^0.1.99",
-    "@opentui/react": "^0.1.99",
-    "effect": "^4.0.0-beta.49",
-    "react": "^19.2.5",
-    "scheduler": "^0.27.0"
-  }
+	"name": "@executor-js/motel",
+	"version": "0.2.5-executor.1",
+	"description": "A local OpenTelemetry ingest + TUI viewer for development, backed by SQLite. (Executor fork of @kitlangton/motel)",
+	"type": "module",
+	"license": "MIT",
+	"author": "Kit Langton",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/UsefulSoftwareCo/motel.git"
+	},
+	"homepage": "https://github.com/kitlangton/motel#readme",
+	"bugs": {
+		"url": "https://github.com/kitlangton/motel/issues"
+	},
+	"keywords": [
+		"opentelemetry",
+		"otel",
+		"tracing",
+		"observability",
+		"tui",
+		"sqlite",
+		"effect",
+		"opentui"
+	],
+	"workspaces": [
+		"web"
+	],
+	"engines": {
+		"bun": ">=1.1.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"files": [
+		"src",
+		"web/dist",
+		"LICENSE",
+		"README.md",
+		"AGENTS.md"
+	],
+	"bin": {
+		"motel": "src/motel.ts",
+		"motel-mcp": "src/mcp.ts"
+	},
+	"scripts": {
+		"clear-motel-debug": "bun run skills/motel-debug/scripts/clear-motel-debug.ts",
+		"dev": "MOTEL_OTEL_ENABLED=true bun run src/motel.ts tui",
+		"start": "bun run src/motel.ts tui",
+		"daemon": "bun run src/motel.ts daemon",
+		"status": "bun run src/motel.ts status",
+		"stop": "bun run src/motel.ts stop",
+		"restart": "bun run src/motel.ts restart",
+		"server": "bun run src/motel.ts server",
+		"mcp": "bun run src/mcp.ts",
+		"test": "bun test",
+		"cli": "bun run src/cli.ts",
+		"instructions": "bun run src/cli.ts instructions",
+		"services": "bun run src/cli.ts services",
+		"logs": "bun run src/cli.ts logs",
+		"trace-logs": "bun run src/cli.ts trace-logs",
+		"span-logs": "bun run src/cli.ts span-logs",
+		"span": "bun run src/cli.ts span",
+		"trace-spans": "bun run src/cli.ts trace-spans",
+		"search-spans": "bun run src/cli.ts search-spans",
+		"trace-stats": "bun run src/cli.ts trace-stats",
+		"log-stats": "bun run src/cli.ts log-stats",
+		"web:dev": "bun run --cwd web dev",
+		"web:build": "bun run --cwd web build",
+		"story:chat": "bun run src/storybook/aiChatStory.tsx",
+		"bench:motel-cold-start": "bun run scripts/bench-motel-cold-start.ts",
+		"bench:ingest-logs": "bun run scripts/bench-ingest-logs.ts",
+		"bench:ingest-traces": "bun run scripts/bench-ingest-traces.ts",
+		"bench:search-spans": "bun run scripts/bench-search-spans.ts",
+		"typecheck": "tsc --noEmit",
+		"prepublishOnly": "bun run web:build"
+	},
+	"devDependencies": {
+		"@effect/language-service": "^0.85.1",
+		"@types/bun": "^1.3.12",
+		"@types/react": "^19.2.14",
+		"typescript": "^6.0.2"
+	},
+	"dependencies": {
+		"@effect/atom-react": "^4.0.0-beta.49",
+		"@effect/opentelemetry": "^4.0.0-beta.49",
+		"@effect/platform-bun": "^4.0.0-beta.50",
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/exporter-logs-otlp-http": "^0.214.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.211.0",
+		"@opentelemetry/sdk-logs": "^0.214.0",
+		"@opentelemetry/sdk-node": "^0.214.0",
+		"@opentelemetry/sdk-trace-base": "^2.5.0",
+		"@opentelemetry/sdk-trace-node": "^2.6.1",
+		"@opentui/core": "^0.1.99",
+		"@opentui/react": "^0.1.99",
+		"effect": "^4.0.0-beta.49",
+		"react": "^19.2.5",
+		"scheduler": "^0.27.0"
+	}
 }
