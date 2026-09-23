@@ -13,7 +13,7 @@ const runQuiet = <A, E, R extends TelemetryStoreReadonly | never>(effect: Effect
 try {
 	switch (command) {
 	case "services": {
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.listServices))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listServices))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -21,7 +21,7 @@ try {
 	case "traces": {
 		const service = args[0] ?? config.otel.serviceName
 		const limit = args[1] ? Number.parseInt(args[1], 10) : config.otel.traceFetchLimit
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.listRecentTraces(service, { limit })))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listRecentTraces(service, { limit })))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -32,7 +32,7 @@ try {
 			throw new Error("Usage: bun run cli trace <trace-id>")
 		}
 
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.getTrace(traceId)))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.getTrace(traceId)))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -54,7 +54,7 @@ try {
 			throw new Error("Usage: bun run cli trace-spans <trace-id>")
 		}
 
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.listTraceSpans(traceId)))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listTraceSpans(traceId)))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -67,7 +67,7 @@ try {
 		const attributeStartIndex = operation ? 2 : 1
 		const attributeFilters = attributeFiltersFromArgs(args.slice(attributeStartIndex))
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.searchSpans({
 					serviceName: service,
 					operation,
@@ -86,7 +86,7 @@ try {
 		const operation = args[1] && !isAttributeFilterToken(args[1]) ? args[1] : undefined
 		const attributeFilters = attributeFiltersFromArgs(args.slice(operation ? 2 : 1))
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.searchTraces({
 					serviceName: service,
 					operation,
@@ -109,7 +109,7 @@ try {
 		}
 
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.traceStats({
 					groupBy,
 					agg,
@@ -130,7 +130,7 @@ try {
 
 	case "logs": {
 		const service = args[0] ?? config.otel.serviceName
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.listRecentLogs(service)))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listRecentLogs(service)))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -140,7 +140,7 @@ try {
 		const body = args[1] && !isAttributeFilterToken(args[1]) ? args[1] : undefined
 		const attributeFilters = attributeFiltersFromArgs(args.slice(body ? 2 : 1))
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.searchLogs({
 					serviceName: service,
 					body,
@@ -162,7 +162,7 @@ try {
 		}
 
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.logStats({
 					groupBy,
 					agg: "count",
@@ -182,7 +182,7 @@ try {
 			throw new Error("Usage: bun run cli trace-logs <trace-id>")
 		}
 
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) => query.listTraceLogs(traceId)))
+		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listTraceLogs(traceId)))
 		console.log(JSON.stringify(result, null, 2))
 		break
 	}
@@ -194,7 +194,7 @@ try {
 		}
 
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.searchLogs({
 					spanId,
 					limit: config.otel.logFetchLimit,
@@ -213,7 +213,7 @@ try {
 		}
 
 		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly.asEffect(), (query) =>
+			Effect.flatMap(TelemetryStoreReadonly, (query) =>
 				query.listFacets({ type, field, limit: 20 }),
 			),
 		)

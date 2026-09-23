@@ -15,6 +15,8 @@ import { TelemetryStoreReadonly } from "./services/TelemetryStore.js"
 import { TelemetryQueryLive } from "./services/TelemetryQuery.js"
 import type { LogItem, TraceItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
+import { decodeProtobufLogs, decodeProtobufTraces } from "./otlpProtobuf.js"
+import type { OtlpLogExportRequest, OtlpTraceExportRequest } from "./otlp.js"
 
 // Set by the RegistryLayer acquisition once the Bun socket has bound.
 // Both /api/health and the registry entry read from here so they agree
@@ -42,7 +44,7 @@ const healthPayload = () => ({
 })
 // Query handlers resolve against the readonly store identifier so they
 // don't contend with the writer connection that owns ingest/retention.
-const withRead = <A>(f: (store: TelemetryStoreReadonly["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TelemetryStoreReadonly.asEffect(), f)
+const withRead = <A>(f: (store: TelemetryStoreReadonly["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TelemetryStoreReadonly, f)
 // Response-building helpers are generic in R so a handler can depend
 // on AsyncIngest (worker-RPC path) or TelemetryStoreReadonly (query
 // path) without forcing every handler onto the same service surface.
@@ -56,6 +58,21 @@ const respondRaw = <R>(effect: Effect.Effect<ReturnType<typeof jsonResponse>, un
 		onFailure: (error) => jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 500),
 		onSuccess: (value) => value,
 	})
+
+const readOtlpBody = <T>(
+	request: {
+		readonly json: Effect.Effect<unknown, unknown>
+		readonly arrayBuffer: Effect.Effect<ArrayBuffer, unknown>
+		readonly headers: Readonly<Record<string, string | undefined>>
+	},
+	decodeProtobuf: (bytes: Uint8Array) => T,
+): Effect.Effect<T, unknown> => {
+	const contentType = (request.headers["content-type"] ?? "").toLowerCase()
+	if (contentType.includes("application/x-protobuf") || contentType.includes("application/protobuf")) {
+		return Effect.map(request.arrayBuffer, (buffer) => decodeProtobuf(new Uint8Array(buffer)))
+	}
+	return Effect.map(request.json, (payload) => payload as T)
+}
 
 // Log page loader: takes the parsed list params + any resource-specific
 // filter values (service, severity, traceId, spanId, body), runs the
@@ -180,9 +197,10 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 			// work cannot block the HTTP event loop.
 			.handleRaw("ingestTraces", ({ request }) =>
 				HttpMiddleware.withLoggerDisabled(respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload })),
+					Effect.flatMap(
+						readOtlpBody<OtlpTraceExportRequest>(request, decodeProtobufTraces),
+						(payload) => Effect.map(
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestTraces({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),
@@ -190,9 +208,10 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 			)
 			.handleRaw("ingestLogs", ({ request }) =>
 				HttpMiddleware.withLoggerDisabled(respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload })),
+					Effect.flatMap(
+						readOtlpBody<OtlpLogExportRequest>(request, decodeProtobufLogs),
+						(payload) => Effect.map(
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestLogs({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),

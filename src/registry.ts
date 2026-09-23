@@ -1,8 +1,9 @@
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import packageJson from "../package.json" with { type: "json" }
 
-export const MOTEL_VERSION = "0.1.0"
+export const MOTEL_VERSION = packageJson.version
 export const MOTEL_SERVICE_ID = "motel-local-server"
 
 const stateHome = () =>

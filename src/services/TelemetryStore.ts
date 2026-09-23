@@ -5,7 +5,7 @@ import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effe
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
-import { attributeMap, nanosToMilliseconds, parseAnyValue, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
+import { attributeMap, nanosToMilliseconds, normalizeOtlpBinaryId, parseAnyValue, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
 
 const isSqliteLockError = (error: unknown) =>
 	error instanceof Error && /(database is locked|database table is locked|SQLITE_BUSY)/i.test(error.message)
@@ -225,20 +225,18 @@ const parseRecord = (value: string): Record<string, string> => {
 	return parsed
 }
 
-const EMPTY_EVENTS: readonly TraceSpanEvent[] = []
-
 const parseEvents = (value: string): readonly TraceSpanEvent[] => {
-	if (value === "" || value === "[]") return EMPTY_EVENTS
+	if (value === "" || value === "[]") return []
 	try {
 		const parsed = JSON.parse(value) as Array<{ name: string; timestamp: number; attributes: Record<string, string> }>
-		if (parsed.length === 0) return EMPTY_EVENTS
+		if (parsed.length === 0) return []
 		return parsed.map((event) => ({
 			name: event.name,
 			timestamp: new Date(event.timestamp),
 			attributes: event.attributes,
 		}))
 	} catch {
-		return EMPTY_EVENTS
+		return []
 	}
 }
 
@@ -616,6 +614,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					CREATE INDEX IF NOT EXISTS idx_logs_trace_time ON logs(trace_id, timestamp_ms DESC);
 					CREATE INDEX IF NOT EXISTS idx_logs_span_time ON logs(span_id, timestamp_ms DESC);
 					CREATE INDEX IF NOT EXISTS idx_logs_severity_time ON logs(severity_text, timestamp_ms DESC);
+					CREATE INDEX IF NOT EXISTS idx_logs_severity_nocase_time ON logs(severity_text COLLATE NOCASE, timestamp_ms DESC);
 
 					CREATE TABLE IF NOT EXISTS trace_summaries (
 						trace_id TEXT PRIMARY KEY,
@@ -1164,6 +1163,10 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 							const scopeName = scopeSpans.scope?.name ?? null
 
 							for (const span of scopeSpans.spans ?? []) {
+								const traceId = normalizeOtlpBinaryId(span.traceId, 16)
+								const spanId = normalizeOtlpBinaryId(span.spanId, 8)
+								if (!traceId || !spanId) continue
+								const parentSpanId = normalizeOtlpBinaryId(span.parentSpanId, 8)
 								const spanAttributes = attributeMap(span.attributes)
 								const mergedAttributes = { ...resourceAttributes, ...spanAttributes }
 								const startTimeMs = nanosToMilliseconds(span.startTimeUnixNano)
@@ -1175,9 +1178,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 								}))
 
 								insertSpan.run(
-									span.traceId,
-									span.spanId,
-									span.parentSpanId ?? null,
+									traceId,
+									spanId,
+									parentSpanId,
 									serviceName,
 									scopeName,
 									span.name ?? "unknown",
@@ -1190,10 +1193,10 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 									JSON.stringify(resourceAttributes),
 									JSON.stringify(events),
 								)
-								deleteSpanAttributes.run(span.traceId, span.spanId)
-								insertSpanAttributesMany(span.traceId, span.spanId, mergedAttributes)
-								touchedOperations.push([span.traceId, span.spanId, span.name ?? "unknown"])
-								touchedTraceIds.add(span.traceId)
+								deleteSpanAttributes.run(traceId, spanId)
+								insertSpanAttributesMany(traceId, spanId, mergedAttributes)
+								touchedOperations.push([traceId, spanId, span.name ?? "unknown"])
+								touchedTraceIds.add(traceId)
 								insertedSpans += 1
 							}
 						}
@@ -1233,9 +1236,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 								const mergedAttributes = { ...resourceAttributes, ...attributes }
 								const timestampMs = nanosToMilliseconds(record.timeUnixNano ?? record.observedTimeUnixNano)
 								const body = stringifyValue(parseAnyValue(record.body))
+								const rawTraceId = attributes.traceId || attributes.trace_id || record.traceId || null
+								const rawSpanId = attributes.spanId || attributes.span_id || record.spanId || null
 								const result = insertLog.run(
-									attributes.traceId || attributes.trace_id || record.traceId || null,
-									attributes.spanId || attributes.span_id || record.spanId || null,
+									normalizeOtlpBinaryId(rawTraceId, 16),
+									normalizeOtlpBinaryId(rawSpanId, 8),
 									serviceName,
 									scopeName,
 									record.severityText ?? "INFO",
@@ -1669,7 +1674,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					params.push(input.serviceName)
 				}
 				if (input.severity) {
-					clauses.push(`severity_text = ?`)
+					clauses.push(`severity_text = ? COLLATE NOCASE`)
 					params.push(input.severity.toUpperCase())
 				}
 				if (input.traceId) {
@@ -1882,7 +1887,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					const group = input.groupBy === "service"
 						? log.serviceName
 						: input.groupBy === "severity"
-							? log.severityText
+							? log.severityText.toUpperCase()
 							: input.groupBy === "scope"
 								? log.scopeName ?? "unknown"
 								: isAttrGroupBy
@@ -1928,7 +1933,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				const groupExpr = input.groupBy === "service"
 					? "service_name"
 					: input.groupBy === "severity"
-						? "severity_text"
+						? "UPPER(severity_text)"
 						: input.groupBy === "scope"
 							? "COALESCE(scope_name, 'unknown')"
 							: "'unknown'"
@@ -1972,11 +1977,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					}
 					if (input.field === "severity") {
 						const rows = db.query(`
-							SELECT severity_text AS value, COUNT(*) AS count
+							SELECT UPPER(severity_text) AS value, COUNT(*) AS count
 							FROM logs
 							WHERE timestamp_ms >= ?
 							${input.serviceName ? "AND service_name = ?" : ""}
-							GROUP BY severity_text
+							GROUP BY value
 							ORDER BY count DESC, value ASC
 							LIMIT ?
 						`).all(...(input.serviceName ? [cutoff, input.serviceName, limit] : [cutoff, limit])) as Array<{ value: string; count: number }>

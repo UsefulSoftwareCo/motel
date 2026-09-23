@@ -38,7 +38,7 @@ export const initialAiCallDetailState: AiCallDetailState = {
 export const aiCallDetailStateAtom = Atom.make(initialAiCallDetailState).pipe(Atom.keepAlive)
 
 export const loadAiCallDetail = (spanId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.getAiCall(spanId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.getAiCall(spanId)))
 
 // AI call detail cache: the `ai.prompt` payload can easily be 50KB+ and
 // we don't want to re-hit SQLite every time j/k moves the selection

@@ -19,7 +19,7 @@ export class LogQueryService extends Context.Service<
 
 export const LogQueryServiceLive = Layer.effect(
 	LogQueryService,
-	Effect.map(TelemetryStore.asEffect(), (store) => LogQueryService.of({
+	Effect.map(TelemetryStore, (store) => LogQueryService.of({
 		listRecentLogs: store.listRecentLogs,
 		listTraceLogs: store.listTraceLogs,
 		searchLogs: store.searchLogs,
