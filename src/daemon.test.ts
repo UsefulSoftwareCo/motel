@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import rootModule from "@opentelemetry/otlp-transformer/build/esm/generated/root.js"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -10,6 +11,16 @@ import { MOTEL_SERVICE_ID } from "./registry.js"
 const repoRoot = path.resolve(import.meta.dir, "..")
 
 const randomPort = () => 29000 + Math.floor(Math.random() * 2000)
+
+const protobufRoot = rootModule as unknown as {
+	readonly opentelemetry: {
+		readonly proto: {
+			readonly collector: {
+				readonly logs: { readonly v1: { readonly ExportLogsServiceRequest: { encode: (message: unknown) => { finish: () => Uint8Array } } } }
+			}
+		}
+	}
+}
 
 interface Harness {
 	readonly runtimeDir: string
@@ -277,6 +288,38 @@ describe("daemon manager", () => {
 		const log = fs.readFileSync(path.join(harness.runtimeDir, "daemon.log"), "utf8")
 		expect(log).not.toContain("/v1/logs")
 		expect(log).toContain("/api/services")
+	})
+
+	test("accepts OTLP protobuf log payloads", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		await Effect.runPromise(harness.manager.ensure)
+		const payload = protobufRoot.opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest.encode({
+			resourceLogs: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "protobuf-fixture" } }] },
+				scopeLogs: [{ logRecords: [{
+					timeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
+					severityText: "INFO",
+					body: { stringValue: "protobuf log" },
+				}] }],
+			}],
+		}).finish()
+		const response = await fetch(`http://127.0.0.1:${harness.port}/v1/logs`, {
+			method: "POST",
+			headers: { "content-type": "application/x-protobuf" },
+			body: payload.buffer instanceof ArrayBuffer
+				? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
+				: Uint8Array.from(payload).buffer,
+		})
+		expect(response.status).toBe(200)
+		await Bun.sleep(100)
+		const probe = new Database(harness.databasePath, { readonly: true })
+		try {
+			const log = probe.query(`SELECT service_name, body FROM logs WHERE body = 'protobuf log'`).get() as { service_name: string; body: string } | null
+			expect(log).toEqual({ service_name: "protobuf-fixture", body: "protobuf log" })
+		} finally {
+			probe.close()
+		}
 	})
 
 	test("repeated ingest does not recursively create Motel telemetry", async () => {

@@ -3,7 +3,8 @@ import * as BunWorkerRunner from "@effect/platform-bun/BunWorkerRunner"
 import { Effect, Layer } from "effect"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import { TelemetryStoreQueryWorkerLive, TelemetryStoreReadonly, type TelemetryStoreReader } from "./TelemetryStore.js"
+import { TelemetryStoreReadonly, type TelemetryStoreReader } from "./TelemetryStore.js"
+import { TelemetryStoreQueryWorkerLive } from "./TelemetryStoreBun.js"
 import { QueryError, QueryRpcs } from "./queryRpc.js"
 
 type QueryMethod = keyof TelemetryStoreReader

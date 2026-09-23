@@ -16,7 +16,8 @@ const Meta = Schema.Struct({
 }).annotate({ identifier: "ListMeta" })
 
 const ServiceList = Schema.Struct({ data: Schema.Array(Schema.String) })
-const Health = Schema.Struct({
+/** Runtime identity returned by the collector health endpoint. */
+export const Health = Schema.Struct({
 	ok: Schema.Boolean,
 	service: Schema.String.pipe(Schema.annotateKey({ description: "Stable identity string. Always 'motel-local-server' — used by the MCP shim to detect impostor processes on a stale port." })),
 	databasePath: Schema.String,

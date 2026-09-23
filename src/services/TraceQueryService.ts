@@ -26,7 +26,7 @@ export class TraceQueryService extends Context.Service<
 
 export const TraceQueryServiceLive = Layer.effect(
 	TraceQueryService,
-	Effect.map(TelemetryStore.asEffect(), (store) => TraceQueryService.of({
+	Effect.map(TelemetryStore, (store) => TraceQueryService.of({
 		listServices: store.listServices,
 		listRecentTraces: store.listRecentTraces,
 		listTraceSummaries: store.listTraceSummaries,

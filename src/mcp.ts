@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { BunRuntime, BunStdio } from "@effect/platform-bun"
 import { Effect, Layer, Logger, Schema } from "effect"
+import { MOTEL_VERSION } from "./registry.js"
 import { McpServer, Tool, Toolkit } from "effect/unstable/ai"
 import { TraceSpanStatus } from "./domain.js"
 import { MotelClient, MotelClientLive } from "./motelClient.js"
@@ -422,7 +423,7 @@ const ServerLayer = McpServer.toolkit(MotelToolkit).pipe(
 	Layer.provide(
 		McpServer.layerStdio({
 			name: "motel",
-			version: "0.1.0",
+			version: MOTEL_VERSION,
 		}),
 	),
 	Layer.provide(BunStdio.layer),

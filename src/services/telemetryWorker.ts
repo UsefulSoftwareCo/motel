@@ -21,7 +21,8 @@ import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import type { OtlpLogExportRequest, OtlpTraceExportRequest } from "../otlp.ts"
 import { IngestError, IngestRpcs } from "./ingestRpc.ts"
-import { TelemetryStore, TelemetryStoreWorkerLive } from "./TelemetryStore.ts"
+import { TelemetryStore } from "./TelemetryStore.ts"
+import { TelemetryStoreWorkerLive } from "./TelemetryStoreBun.ts"
 
 // Wire the two RPC methods to the existing TelemetryStore service.
 // The store's ingest methods already carry their own Effect.fn spans,

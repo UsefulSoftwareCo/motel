@@ -140,3 +140,23 @@ export const spanKindLabel = (kind: number | undefined): string | null => {
 }
 
 export const spanStatusLabel = (code: number | undefined): "ok" | "error" => (code === 2 ? "error" : "ok")
+
+/** Normalize OTLP hex or canonical base64 binary IDs to lowercase hex. */
+export const normalizeOtlpBinaryId = (
+	value: string | null | undefined,
+	expectedBytes: 8 | 16,
+): string | null => {
+	if (!value) return null
+	const expectedHexLength = expectedBytes * 2
+	if (value.length === expectedHexLength && /^[0-9a-f]+$/.test(value)) return value
+	if (value.length === expectedHexLength && /^[0-9a-fA-F]+$/.test(value)) return value.toLowerCase()
+	try {
+		const bytes = Buffer.from(value, "base64")
+		if (bytes.length === expectedBytes && bytes.toString("base64") === value) {
+			return bytes.toString("hex")
+		}
+	} catch {
+		// Preserve non-standard human-readable IDs used by local fixtures and custom exporters.
+	}
+	return value
+}

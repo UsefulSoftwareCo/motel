@@ -1,20 +1,13 @@
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import packageJson from "../package.json" with { type: "json" }
 
-export const MOTEL_VERSION = "0.1.0"
+export const MOTEL_VERSION = packageJson.version
 export const MOTEL_SERVICE_ID = "motel-local-server"
 
-const stateHome = () =>
-	process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state")
-
-/**
- * The shared, machine-global motel state directory. Holds the SQLite
- * database, daemon log, daemon lock, and the per-pid instance registry.
- * One motel daemon serves every project on this machine — there is no
- * per-cwd state.
- */
-export const motelStateDir = () => process.env.MOTEL_RUNTIME_DIR?.trim() || path.join(stateHome(), "motel")
+import { motelStateDir } from "./statePaths.js"
+export { motelStateDir } from "./statePaths.js"
 
 export const registryDir = (runtimeDir = motelStateDir()) => path.join(runtimeDir, "instances")
 

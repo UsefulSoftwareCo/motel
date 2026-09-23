@@ -5,10 +5,10 @@ import { TelemetryStoreReadonly } from "../services/TelemetryStore.ts"
 import { makeCachedLoader } from "./cachedLoader.ts"
 
 export const loadTraceServices = () =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listServices))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listServices))
 
 export const loadRecentTraceSummaries = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listTraceSummaries(serviceName)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceSummaries(serviceName)))
 
 /**
  * Server-side trace summary search. Accepts any combination of:
@@ -29,7 +29,7 @@ export const loadFilteredTraceSummaries = (
 		readonly aiText?: string | null
 	},
 ) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.searchTraceSummaries({
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.searchTraceSummaries({
 		serviceName,
 		attributeFilters: options.attributeFilters,
 		aiText: options.aiText ?? null,
@@ -37,10 +37,10 @@ export const loadFilteredTraceSummaries = (
 	})))
 
 export const loadTraceAttributeKeys = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_keys", serviceName, limit: 200 })))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listFacets({ type: "traces", field: "attribute_keys", serviceName, limit: 200 })))
 
 export const loadTraceAttributeValues = (serviceName: string, key: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listFacets({ type: "traces", field: "attribute_values", serviceName, key, limit: 200 })))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listFacets({ type: "traces", field: "attribute_values", serviceName, key, limit: 200 })))
 
 // ---------------------------------------------------------------------------
 // Facet cache (drives the `f` attribute filter picker)
@@ -92,10 +92,10 @@ export const invalidateFacetCaches = () => {
 }
 
 export const loadTraceDetail = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.getTrace(traceId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.getTrace(traceId)))
 
 export const loadTraceLogs = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listTraceLogs(traceId)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceLogs(traceId)))
 
 export const loadServiceLogs = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly.asEffect(), (service) => service.listRecentLogs(serviceName)))
+	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listRecentLogs(serviceName)))
