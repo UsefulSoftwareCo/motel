@@ -21,12 +21,12 @@ export interface ListParams {
 	readonly attributeContainsFilters: Readonly<Record<string, string>>
 }
 
-export const TRACE_LIST: ListBounds = { defaultLimit: 20, maxLimit: 100, defaultLookback: 60, maxLookback: 24 * 60 }
-export const SPAN_LIST: ListBounds = { defaultLimit: 100, maxLimit: 500, defaultLookback: 60, maxLookback: 24 * 60 }
-export const LOG_LIST: ListBounds = { defaultLimit: 100, maxLimit: 500, defaultLookback: 60, maxLookback: 24 * 60 }
-export const AI_LIST: ListBounds = { defaultLimit: 20, maxLimit: 500, defaultLookback: 60, maxLookback: 24 * 60 }
-export const TRACE_STATS: ListBounds = { defaultLimit: 20, maxLimit: 100, defaultLookback: 60, maxLookback: 24 * 60 }
-export const LOG_STATS: ListBounds = { defaultLimit: 20, maxLimit: 500, defaultLookback: 60, maxLookback: 24 * 60 }
+export const TRACE_LIST: ListBounds = { defaultLimit: 20, maxLimit: 100, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
+export const SPAN_LIST: ListBounds = { defaultLimit: 100, maxLimit: 500, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
+export const LOG_LIST: ListBounds = { defaultLimit: 100, maxLimit: 500, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
+export const AI_LIST: ListBounds = { defaultLimit: 20, maxLimit: 500, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
+export const TRACE_STATS: ListBounds = { defaultLimit: 20, maxLimit: 100, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
+export const LOG_STATS: ListBounds = { defaultLimit: 20, maxLimit: 500, defaultLookback: 60, maxLookback: 7 * 24 * 60 }
 
 export const requestUrl = (request: { readonly url: string }, baseUrl: string) => new URL(request.url, baseUrl)
 

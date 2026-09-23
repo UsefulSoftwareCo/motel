@@ -1,7 +1,5 @@
-import { Database } from "bun:sqlite"
-import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
-import { dirname } from "node:path"
-import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
+import type { TelemetryDatabase } from "./TelemetryDatabase.js"
+import { Cause, Clock, Effect, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
@@ -503,76 +501,12 @@ export interface TelemetryStoreOptions {
 	readonly runRetention: boolean
 }
 
-const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
+/** Construct the shared query and ingest logic over an owned SQLite connection. */
+export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryStoreOptions) =>
 	Effect.gen(function* () {
-		const fileSystem = yield* FileSystem.FileSystem
-		yield* fileSystem.makeDirectory(dirname(config.otel.databasePath), { recursive: true })
-		const db = yield* Effect.acquireRelease(
-			Effect.sync(() => new Database(config.otel.databasePath, {
-				create: !opts.readonly,
-				readonly: opts.readonly,
-			})),
-			(db) => Effect.sync(() => {
-				if (!opts.readonly) {
-					// `PRAGMA optimize` at close persists any stats SQLite gathered
-					// during the session, so the next process start gets an accurate
-					// query planner on the first query instead of a 3-second cold
-					// run. Cheap: it skips work unless stats have drifted.
-					try { db.exec(`PRAGMA optimize;`) } catch { /* nothing */ }
-				}
-				db.close()
-			}),
-		)
-		if (opts.readonly) {
-			// Readonly connections skip schema init entirely — the schema
-			// already exists (a writer created it) and any `CREATE TABLE IF
-			// NOT EXISTS` / `PRAGMA journal_mode = WAL` statement would
-			// attempt a write and fight the daemon for the write lock.
-			// `query_only = 1` logically blocks any DML the app might
-			// accidentally send; still bump cache + mmap since those are
-			// safe and keep queries fast.
-			db.exec(`
-				PRAGMA query_only = 1;
-				PRAGMA busy_timeout = 15000;
-				PRAGMA cache_size = -65536;
-				PRAGMA mmap_size = 268435456;
-			`)
-		} else {
-			db.exec(`
-				-- Bump cache above the 2MB default. 64MB fits most hot index pages
-				-- (trace_summaries, spans, span_attributes indexes) in RAM even on
-				-- multi-GB databases, cutting cold-read latency meaningfully on
-				-- picker / search queries that sweep the index.
-				PRAGMA cache_size = -65536;
-				-- Let SQLite memory-map the first 256MB of the file. This is a
-				-- cheap way to avoid read() syscalls on hot pages and lets the OS
-				-- page cache serve index lookups directly. Safe on macOS and Linux;
-				-- SQLite silently caps at actual file size for smaller DBs.
-				PRAGMA mmap_size = 268435456;
-			`)
-			// auto_vacuum is a header-level setting: it only takes effect on
-			// an empty DB, or on the next VACUUM after a change. Setting it
-			// here, BEFORE the first CREATE TABLE, is the only path that
-			// makes incremental_vacuum work without a full VACUUM. For
-			// existing DBs that predate this setting keep their current mode;
-			// Motel never performs a surprise full-file VACUUM at startup.
-			try { db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`) } catch { /* ignore */ }
+		if (!opts.readonly) {
 			try {
 				db.exec(`
-					PRAGMA journal_mode = WAL;
-					PRAGMA synchronous = NORMAL;
-					PRAGMA temp_store = MEMORY;
-					-- WAL checkpoint automatically when it grows past ~16MB. Without
-					-- this the WAL happily runs into the hundreds of MB and queries
-					-- start paying the cost of walking the WAL on every read.
-					PRAGMA wal_autocheckpoint = 4000;
-					-- Hard floor for the WAL file. Auto-checkpoint controls *when*
-					-- pages move out of the WAL; size_limit controls how much the
-					-- WAL file is allowed to grow on disk. 128MB is generous enough
-					-- to absorb a long write burst without blocking on truncation,
-					-- tight enough that a wedged retention loop can't hide a 20GB
-					-- WAL the way a default no-limit configuration can.
-					PRAGMA journal_size_limit = 134217728;
 
 					CREATE TABLE IF NOT EXISTS spans (
 						trace_id TEXT NOT NULL,
@@ -776,17 +710,12 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		// the attribute picker facet run with guessed row estimates and
 		// pay 3-4s on cold open instead of 400ms.
 		try {
-			db.exec(`PRAGMA analysis_limit = 1000; PRAGMA optimize;`)
+			db.optimize()
 		} catch {
 			// ANALYZE / optimize failures are never fatal — queries still work,
 			// they just run with default row estimates.
 		}
-			// Longer busy timeout: the ingest worker holds the write lock for up
-			// to a few seconds during big OTLP batches, and the daemon's retention
-			// passes can do the same. Apply this AFTER startup maintenance so
-			// lock-conflicted bootstrap steps fail fast instead of stalling health
-			// for the full 15s timeout.
-			try { db.exec(`PRAGMA busy_timeout = 15000;`) } catch { /* ignore */ }
+
 		} // end: if (!opts.readonly) writer init
 
 		const insertSpan = db.query(`
@@ -844,7 +773,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 		const deleteSpanAttributes = db.query(`DELETE FROM span_attributes WHERE trace_id = ? AND span_id = ?`)
 		const insertSpanAttribute = db.query(`INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES (?, ?, ?, ?)`)
-		const spanAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const spanAttributeInsertManyByCount = new Map<number, ReturnType<TelemetryDatabase["query"]>>()
 		const insertSpanAttributesMany = (traceId: string, spanId: string, attributes: Readonly<Record<string, string>>) => {
 			const entries = Object.entries(attributes)
 			if (entries.length === 0) return
@@ -862,8 +791,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		}
 		const deleteSpanOperationSearch = db.query(`DELETE FROM span_operation_fts WHERE trace_id = ? AND span_id = ?`)
 		const insertSpanOperationSearch = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES (?, ?, ?)`)
-		const deleteSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const insertSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanOperationSearchManyByCount = new Map<number, ReturnType<TelemetryDatabase["query"]>>()
+		const insertSpanOperationSearchManyByCount = new Map<number, ReturnType<TelemetryDatabase["query"]>>()
 		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
 			if (operations.length === 0) return
 			if (operations.length === 1) {
@@ -888,7 +817,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			insertQuery.run(...operations.flatMap(([traceId, spanId, operationName]) => [traceId, spanId, operationName]))
 		}
 		const insertLogAttribute = db.query(`INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`)
-		const logAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const logAttributeInsertManyByCount = new Map<number, ReturnType<TelemetryDatabase["query"]>>()
 		const insertLogAttributesMany = (logId: number, attributes: Readonly<Record<string, string>>) => {
 			const entries = Object.entries(attributes)
 			if (entries.length === 0) return
@@ -905,7 +834,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			query.run(...entries.flatMap(([key, value]) => [logId, key, value]))
 		}
 		const insertLogBodySearch = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES (?, ?)`)
-		const insertLogBodySearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertLogBodySearchManyByCount = new Map<number, ReturnType<TelemetryDatabase["query"]>>()
 		const insertLogBodySearchMany = (entries: ReadonlyArray<readonly [string, string]>) => {
 			if (entries.length === 0) return
 			if (entries.length === 1) {
@@ -927,12 +856,6 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		// LOW threshold there's nothing worth doing; above HIGH we are in the
 		// 17GB-DB-with-10GB-freelist failure mode and need to reclaim aggressively
 		// even if it costs writer-lock time.
-		const FREELIST_LOW_RATIO = 0.05
-		const FREELIST_MID_RATIO = 0.20
-		const FREELIST_HIGH_RATIO = 0.50
-		const VACUUM_PAGES_NORMAL = 2000     // ~8MB/pass
-		const VACUUM_PAGES_BUSY = 20000      // ~80MB/pass — used when freelist > 20%
-		const VACUUM_PAGES_PANIC = 50000     // ~200MB/pass — only when ratio > 50%
 
 		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
 
@@ -948,35 +871,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			}
 		}
 
-		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
-			yield* Effect.sync(() => {
-				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
-				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
-				if (pageCount === 0) return
-				const ratio = freePages / pageCount
-				if (ratio < FREELIST_LOW_RATIO) return
-
-				// Adaptive vacuum sizing — fixed 2000 pages/min could not keep
-				// up with sustained deletions, leaking 10GB of freelist over
-				// time. Scale the per-pass work to the size of the backlog so
-				// we stay roughly proportional to the deficit.
-				const pages =
-					ratio >= FREELIST_HIGH_RATIO ? VACUUM_PAGES_PANIC :
-					ratio >= FREELIST_MID_RATIO ? VACUUM_PAGES_BUSY :
-					VACUUM_PAGES_NORMAL
-
-				try { db.exec(`PRAGMA incremental_vacuum(${pages});`) } catch { /* ignore */ }
-
-				// In WAL mode incremental_vacuum only moves pages — the file
-				// shrinks on the next checkpoint. PASSIVE silently skips when
-				// readers are active (the failure mode the agent's research
-				// flagged: checkpoint starvation). Use RESTART normally and
-				// TRUNCATE in panic mode to physically shrink the WAL when it
-				// has grown.
-				const mode = ratio >= FREELIST_HIGH_RATIO ? "TRUNCATE" : "RESTART"
-				try { db.exec(`PRAGMA wal_checkpoint(${mode});`) } catch { /* ignore */ }
-			})
-		})
+		const reclaimSpace = () => Effect.sync(() => db.reclaim())
 
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
@@ -1001,10 +896,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// batch of the oldest completed traces. `(page_count - freelist_count)`
 				// ignores freed-but-not-vacuumed pages so a large freelist doesn't
 				// trigger a deletion death spiral.
-				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
-				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
-				const pageSize = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
-				const dbSize = (pageCount - freePages) * pageSize
+				const dbSize = db.usedBytes()
 				if (dbSize > maxDbSizeBytes) {
 					const oldest = db.query(
 						`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
@@ -1059,7 +951,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// when readers are active, which is the documented mechanism
 				// behind WAL/freelist starvation when ingest is busy.
 				if (toEvict.size === 0 && !deletedLogs && !deletedOrphans) return
-				try { db.exec(`PRAGMA wal_checkpoint(RESTART);`) } catch { /* ignore */ }
+				db.checkpoint("RESTART")
 
 				// Incremental FTS5 merge — DELETE on an FTS5-indexed row
 				// leaves a tombstone in the segment tree that only `merge`
@@ -1099,13 +991,14 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			// grows. 15 minutes is slower than ingestion rates we care about but
 			// frequent enough that the attribute picker stays snappy.
 			const refreshPlannerStats = Effect.sync(() => {
-				try { db.exec(`PRAGMA optimize;`) } catch { /* ignore */ }
+				db.optimize()
 			})
 			yield* Effect.forkScoped(Effect.repeat(refreshPlannerStats, Schedule.spaced("15 minutes")))
 		}
 
 		// Incrementally rebuild historical AI attributes in bounded batches.
 		// Queries fall back to LIKE until the persistent marker is complete.
+		let backfillBatch: Effect.Effect<unknown> = Effect.void
 		if (hasAttrFts && !opts.readonly) {
 			const backfillAttrFtsBatch = Effect.sync(() => {
 				try {
@@ -1146,7 +1039,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					pending ? Effect.andThen(Effect.sleep("100 millis"), backfillAttrFts) : Effect.void,
 				),
 			)
-			yield* Effect.forkScoped(backfillAttrFts)
+			backfillBatch = backfillAttrFtsBatch
+			if (opts.runRetention) yield* Effect.forkScoped(backfillAttrFts)
 		}
 
 		const ingestTraces = Effect.fn("motel/TelemetryStore.ingestTraces")(function* (payload: OtlpTraceExportRequest) {
@@ -2516,40 +2410,6 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			searchAiCalls,
 			getAiCall,
 			aiCallStats,
-			runRetentionNow: cleanupExpired(),
+			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
 		})
 	})
-
-/** Compatibility factory for callers constructing a writer/query-capable store layer. */
-export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) =>
-	Layer.effect(TelemetryStore, makeTelemetryStoreEffect(opts)).pipe(Layer.provide(BunFileSystem.layer))
-
-/**
- * Default writer runtime used by tests and direct store consumers.
- */
-export const TelemetryStoreLive = makeTelemetryStoreLayer({ readonly: false, runRetention: true })
-
-/**
- * The ingest worker's writer. It is the managed daemon's sole owner of
- * schema migrations, FTS backfill, retention, and page reclamation.
- */
-export const TelemetryStoreWorkerLive = TelemetryStoreLive
-
-/**
- * Read-only instance for query-only processes (currently the TUI and
- * HTTP query handlers). Skips every DDL/DML statement at startup so
- * the connection can be opened while a writer is mid-transaction
- * without racing for the write lock. Provided as TelemetryStoreReadonly
- * — a distinct service identifier so it can coexist with the writer
- * TelemetryStore in the same runtime.
- */
-export const TelemetryStoreReadonlyLive = Layer.effect(TelemetryStoreReadonly, makeTelemetryStoreEffect({ readonly: true, runRetention: false })).pipe(Layer.provide(BunFileSystem.layer))
-
-/** Query-worker reader that waits for the sole writer to finish schema bootstrap. */
-export const TelemetryStoreQueryWorkerLive = Layer.effect(
-	TelemetryStoreReadonly,
-	makeTelemetryStoreEffect({ readonly: true, runRetention: false }).pipe(
-		Effect.map((store) => TelemetryStoreReadonly.of(store)),
-		Effect.retry(Schedule.spaced("50 millis")),
-	),
-).pipe(Layer.provide(BunFileSystem.layer))

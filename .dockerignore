@@ -1,0 +1,6 @@
+.git
+.reference
+.local
+node_modules
+dist
+web/dist

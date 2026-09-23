@@ -83,13 +83,19 @@
     "release:validate": "bun run scripts/validate-release.ts",
     "typecheck": "tsc --noEmit",
     "web:typecheck": "tsc --noEmit -p web/tsconfig.json",
-    "prepublishOnly": "bun run web:build"
+    "prepublishOnly": "bun run web:build",
+    "workerd:build": "bun run scripts/build-workerd.ts",
+    "workerd:serve": "workerd serve workerd/motel.capnp --experimental",
+    "workerd:test": "bun test src/workerd.integration.test.ts"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260923.1",
     "@effect/language-service": "^0.86.2",
     "@types/bun": "^1.3.14",
     "@types/react": "^19.2.17",
-    "typescript": "^6.0.3"
+    "esbuild": "0.28.2",
+    "typescript": "^6.0.3",
+    "workerd": "1.20260901.1"
   },
   "dependencies": {
     "@effect/atom-react": "4.0.0-beta.90",

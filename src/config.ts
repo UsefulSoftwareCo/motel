@@ -1,4 +1,4 @@
-import { motelStateDir } from "./registry.js"
+import { motelStateDir } from "./statePaths.js"
 import * as path from "node:path"
 
 const parseBoolean = (value: string | undefined, defaultValue: boolean) => {

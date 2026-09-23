@@ -5,7 +5,7 @@ import { SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs"
 import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base"
 import { Layer, ManagedRuntime } from "effect"
 import { config } from "./config.js"
-import { TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
+import { TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStoreBun.js"
 
 const telemetryLayer = NodeSdk.layer(() => ({
 	spanProcessor: new SimpleSpanProcessor(
