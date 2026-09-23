@@ -61,7 +61,7 @@
     "restart": "bun run src/motel.ts restart",
     "server": "bun run src/motel.ts server",
     "mcp": "bun run src/mcp.ts",
-    "test": "bun test",
+    "test": "bun run web:build && bun run workerd:build && bun test",
     "cli": "bun run src/cli.ts",
     "instructions": "bun run src/cli.ts instructions",
     "services": "bun run src/cli.ts services",
@@ -86,7 +86,7 @@
     "prepublishOnly": "bun run web:build",
     "workerd:build": "bun run scripts/build-workerd.ts",
     "workerd:serve": "workerd serve workerd/motel.capnp --experimental",
-    "workerd:test": "bun test src/workerd.integration.test.ts"
+    "workerd:test": "bun run web:build && bun run workerd:build && bun test src/workerd.integration.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260923.1",

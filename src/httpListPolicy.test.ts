@@ -11,9 +11,14 @@ describe("HTTP list policy", () => {
 		}, LOG_LIST, BASE_URL)
 
 		expect(params.limit).toBe(500)
-		expect(params.lookbackMinutes).toBe(24 * 60)
+		expect(params.lookbackMinutes).toBe(7 * 24 * 60)
 		expect(params.attributeFilters).toEqual({ "session.id": "abc" })
 		expect(params.attributeContainsFilters).toEqual({ message: "failed" })
+	})
+
+	it("preserves a lookback inside the seven-day retrieval window", () => {
+		const params = parseListParams({ url: "/api/logs?lookback=6d" }, LOG_LIST, BASE_URL)
+		expect(params.lookbackMinutes).toBe(6 * 24 * 60)
 	})
 
 	it("round-trips a trace cursor through page metadata", () => {

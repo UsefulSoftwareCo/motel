@@ -35,6 +35,3 @@ jobs:
 
       - name: Test
         run: bun run test
-
-      - name: Build web
-        run: bun run web:build
