@@ -2,8 +2,8 @@ import * as BunWorker from "@effect/platform-bun/BunWorker"
 import { Duration, Effect, Exit, Layer, Scope } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type { WorkerError } from "effect/unstable/workers/WorkerError"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
+import { WorkerError } from "effect/unstable/workers/WorkerError"
+import { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import { TelemetryStoreReadonly, type TelemetryStoreReader } from "./TelemetryStore.js"
 import { QueryRpcs } from "./queryRpc.js"
 
@@ -16,28 +16,45 @@ const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
 	Layer.provide(BunWorker.layer(() => new Worker(new URL("./telemetryQueryWorker.ts", import.meta.url)))),
 )
 
-const query = <A>(getClient: Effect.Effect<QueryClientEntry, unknown>, invalidateClient: Effect.Effect<void>, method: QueryMethod, args: readonly unknown[] = []) =>
-	Effect.flatMap(getClient, ({ client, clientScope }) => client.query({ method, args }).pipe(
-		Effect.onError(() => Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)),
-	)).pipe(
+const query = <A>(
+	getClient: Effect.Effect<QueryClientEntry, unknown>,
+	invalidateClient: Effect.Effect<void>,
+	method: QueryMethod,
+	args: readonly unknown[] = [],
+) =>
+	Effect.flatMap(getClient, ({ client, clientScope }) =>
+		client
+			.query({ method, args })
+			.pipe(
+				Effect.tapError((error) =>
+					error instanceof RpcClientError || error instanceof WorkerError
+						? Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)
+						: Effect.void,
+				),
+			),
+	).pipe(
 		Effect.map((result) => result as A),
-		Effect.mapError((error) => error instanceof Error ? error : new Error(String(error))),
+		Effect.mapError((error) => (error instanceof Error ? error : new Error(String(error)))),
 	)
 
 export const TelemetryQueryLive = Layer.effect(
 	TelemetryStoreReadonly,
-	Effect.gen(function*() {
+	Effect.gen(function* () {
 		const scope = yield* Scope.Scope
-		const [getClient, invalidateClient] = yield* Effect.cachedInvalidateWithTTL(Effect.gen(function*() {
-			const clientScope = yield* Scope.fork(scope, "sequential")
-			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
-			const client = yield* RpcClient.make(QueryRpcs).pipe(
-				Effect.provide(protocolContext),
-				Effect.provideService(Scope.Scope, clientScope),
-			)
-			return { client, clientScope }
-		}), Duration.infinity)
-		const run = <A>(method: QueryMethod, args: readonly unknown[] = []) => query<A>(getClient, invalidateClient, method, args)
+		const [getClient, invalidateClient] = yield* Effect.cachedInvalidateWithTTL(
+			Effect.gen(function* () {
+				const clientScope = yield* Scope.fork(scope, "sequential")
+				const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
+				const client = yield* RpcClient.make(QueryRpcs).pipe(
+					Effect.provide(protocolContext),
+					Effect.provideService(Scope.Scope, clientScope),
+				)
+				return { client, clientScope }
+			}),
+			Duration.infinity,
+		)
+		const run = <A>(method: QueryMethod, args: readonly unknown[] = []) =>
+			query<A>(getClient, invalidateClient, method, args)
 		return TelemetryStoreReadonly.of({
 			listServices: run("listServices"),
 			listRecentTraces: (serviceName, options) => run("listRecentTraces", [serviceName, options]),
