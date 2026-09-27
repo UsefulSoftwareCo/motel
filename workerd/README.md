@@ -26,6 +26,16 @@ read-only disk service named `ASSETS`, and persistent local disk storage.
 Settings use the same `MOTEL_OTEL_*` names, supplied as text bindings. Health uses
 PID 0 because a worker does not own an operating-system process.
 
+The collector's memory and store are bounded by configuration. It reads at most
+`MOTEL_OTEL_MAX_PENDING_INGEST` exports at once (default 16), each at most
+`MOTEL_OTEL_MAX_INGEST_BYTES` (default 16 MiB). It answers a further export with
+429 and `Retry-After: 1`, and an oversized one with 413, and counts both;
+`GET /api/ingest` reports the queue and the counts. Spans are written to SQLite
+as each export arrives. Every retention pass evicts the oldest completed traces
+until the store is within `MOTEL_OTEL_RETENTION_HOURS`, `MOTEL_OTEL_MAX_SPANS`
+(default 1,000,000) and `MOTEL_OTEL_MAX_DB_SIZE_MB` (default 1024), spending at
+most `MOTEL_OTEL_RETENTION_PASS_BUDGET_MS` (default 500) of writer time.
+
 `bun run workerd:test` runs the built worker as a real process. It verifies HTTP
 trace/log ingestion, searches, seven-day retrieval, alarm retention, malformed
 payload refusal, and retained data after SIGKILL. Run `bun run workerd:build`

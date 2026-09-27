@@ -41,6 +41,14 @@ export const config = {
 		logFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_LOG_LIMIT, 80),
 		retentionHours: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_HOURS, 168),
 		maxDbSizeMb: parsePositiveInt(process.env.MOTEL_OTEL_MAX_DB_SIZE_MB, 1024),
+		// Stored spans are also bounded by count, independent of their size on disk.
+		maxSpans: parsePositiveInt(process.env.MOTEL_OTEL_MAX_SPANS, 1_000_000),
+		// One retention pass evicts until every bound holds, within this much writer time.
+		retentionPassBudgetMs: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_PASS_BUDGET_MS, 500),
+		// Exports the workerd collector reads at once, and the largest it accepts. Beyond
+		// either it refuses the export and counts it rather than buffering it.
+		maxPendingIngest: parsePositiveInt(process.env.MOTEL_OTEL_MAX_PENDING_INGEST, 16),
+		maxIngestBytes: parsePositiveInt(process.env.MOTEL_OTEL_MAX_INGEST_BYTES, 16 * 1024 * 1024),
 		retentionTraceBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_TRACE_BATCH, 100),
 		retentionLogBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_LOG_BATCH, 5_000),
 		retentionIntervalSeconds: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS, 10),
