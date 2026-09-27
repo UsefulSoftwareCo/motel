@@ -478,6 +478,11 @@ export class TelemetryStore extends Context.Service<
 		readonly ingestTraces: (payload: OtlpTraceExportRequest) => Effect.Effect<{ readonly insertedSpans: number }, Error>
 		readonly ingestLogs: (payload: OtlpLogExportRequest) => Effect.Effect<{ readonly insertedLogs: number }, Error>
 		readonly runRetentionNow: Effect.Effect<void, Error>
+		/**
+		 * Evict now when stored telemetry exceeds `MOTEL_OTEL_MAX_DB_SIZE_MB`, so the store's size
+		 * holds between retention passes rather than only after each. A no-op within the bound.
+		 */
+		readonly holdSizeBound: Effect.Effect<void, Error>
 	}
 >()("motel/TelemetryStore") {}
 
@@ -2446,5 +2451,6 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			getAiCall,
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
+			holdSizeBound: Effect.suspend(() => (db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
 		})
 	})
