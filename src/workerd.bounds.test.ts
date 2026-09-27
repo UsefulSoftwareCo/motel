@@ -35,13 +35,14 @@ const bounds = {
 	MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 1,
 } as const
 
-const startCollector = async () => {
-	const directory = await mkdtemp(path.join(tmpdir(), "motel-bounds-"))
+/** Start the built worker; given the directory of a stopped collector, on that collector's store. */
+const startCollector = async (settings: Partial<Record<keyof typeof bounds, number>> = {}, reuse?: string) => {
+	const directory = reuse ?? (await mkdtemp(path.join(tmpdir(), "motel-bounds-")))
 	const port = await freePort()
 	const inspector = await freePort()
-	await mkdir(path.join(directory, "data"))
+	if (reuse === undefined) await mkdir(path.join(directory, "data"))
 	await copyFile(path.join(root, "dist/workerd/motel.mjs"), path.join(directory, "motel.mjs"))
-	const bindings = Object.entries(bounds)
+	const bindings = Object.entries({ ...bounds, ...settings })
 		.map(([name, value]) => `, (name = ${JSON.stringify(name)}, text = ${JSON.stringify(String(value))})`)
 		.join("")
 	const config = (await readFile(path.join(root, "workerd/motel.capnp"), "utf8"))
@@ -51,7 +52,7 @@ const startCollector = async () => {
 		.replace("127.0.0.1:27687", `127.0.0.1:${port}`)
 		.replace('(name = "ASSETS", service = "assets")', `(name = "ASSETS", service = "assets")${bindings}`)
 	await writeFile(path.join(directory, "config.capnp"), config)
-	const log = path.join(directory, "server.log")
+	const log = path.join(directory, `server-${port}.log`)
 	const server = Bun.spawn(
 		[
 			path.join(root, "node_modules/.bin/workerd"),
@@ -177,10 +178,12 @@ test("workerd collector holds its configured memory and retention bounds under s
 	const collector = await startCollector()
 	const isolate = await inspect(collector.inspector)
 	try {
-		// Up to 400 spans a second: twelve times the span bound and several times the size bound.
-		const requests = 180
+		// Up to 400 spans a second for 90 seconds: twenty-four times the span bound and several
+		// times the size bound.
+		const requests = 360
 		const perRequest = 100
 		let peakExternal = 0
+		let peakHeap = 0
 		let accepted = 0
 		for (let tick = 0; tick < requests; tick++) {
 			const at = Date.now()
@@ -188,7 +191,11 @@ test("workerd collector holds its configured memory and retention bounds under s
 			expect(response.status).toBe(200)
 			accepted += ((await response.json()) as { insertedSpans: number }).insertedSpans
 			// Sampled without forcing a collection: what the process holds is what the kernel counts.
-			if (tick % 4 === 0) peakExternal = Math.max(peakExternal, (await isolate.usage()).backingStorageSize)
+			if (tick % 4 === 0) {
+				const usage = await isolate.usage()
+				peakExternal = Math.max(peakExternal, usage.backingStorageSize)
+				peakHeap = Math.max(peakHeap, usage.totalSize)
+			}
 			await Bun.sleep(Math.max(0, 250 - (Date.now() - at)))
 		}
 		expect(accepted).toBe(requests * perRequest)
@@ -198,6 +205,12 @@ test("workerd collector holds its configured memory and retention bounds under s
 		expect(peakExternal / mebibyte).toBeLessThanOrEqual(
 			(bounds.MOTEL_OTEL_MAX_PENDING_INGEST * bounds.MOTEL_OTEL_MAX_INGEST_BYTES) / mebibyte + 8,
 		)
+		// The heap V8 has reserved, before any forced collection. After a collection the isolate
+		// holds about 15 MiB; between collections V8 lets the young and old generations grow to a
+		// few times that and then collects. Per-export objects that survive until the export is
+		// stored are promoted instead, and the heap grows with every export: an export's text held
+		// while it was stored grew it past 90 MiB within this run.
+		expect(peakHeap / mebibyte).toBeLessThanOrEqual(64)
 		// No span is kept in memory once it is stored.
 		await isolate.collect()
 		expect((await isolate.usage()).usedSize / mebibyte).toBeLessThanOrEqual(32)
@@ -211,6 +224,37 @@ test("workerd collector holds its configured memory and retention bounds under s
 	expect(stored.spans).toBeGreaterThan(0)
 	expect(stored.spans).toBeLessThanOrEqual(bounds.MOTEL_OTEL_MAX_SPANS)
 	expect(stored.bytes).toBeLessThanOrEqual(bounds.MOTEL_OTEL_MAX_DB_SIZE_MB * mebibyte)
+	await rm(collector.directory, { recursive: true, force: true })
+}, 180_000)
+
+test("workerd collector keeps its database file within the size bound between retention passes", async () => {
+	// Size is the only bound in reach, and no retention pass runs during the load: only the
+	// collector's own ingest path can hold the bound.
+	const collector = await startCollector({ MOTEL_OTEL_MAX_SPANS: 10_000_000, MOTEL_OTEL_MAX_DB_SIZE_MB: 4, MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600 })
+	const database = async () => {
+		const store = path.join(collector.directory, "data", "motel")
+		const file = (await readdir(store)).find((name) => name.endsWith(".sqlite") && name !== "metadata.sqlite")
+		return file === undefined ? 0 : Bun.file(path.join(store, file)).size
+	}
+	let peakFile = 0
+	try {
+		// About 30 MiB of stored telemetry, seven times the bound.
+		for (let tick = 0; tick < 120; tick++) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(100)))
+			expect(response.status).toBe(200)
+			await response.arrayBuffer()
+			peakFile = Math.max(peakFile, await database())
+		}
+	} finally {
+		await collector.stop()
+	}
+	peakFile = Math.max(peakFile, await database())
+	const stored = await storedTelemetry(collector.directory)
+	expect(stored.spans).toBeGreaterThan(0)
+	expect(stored.bytes).toBeLessThanOrEqual(4 * mebibyte)
+	// The file holds the stored telemetry and the pages it freed, which later exports reuse. It
+	// exceeds the bound by at most one export.
+	expect(peakFile).toBeLessThanOrEqual(4 * mebibyte + bounds.MOTEL_OTEL_MAX_INGEST_BYTES)
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
@@ -250,10 +294,37 @@ test("workerd collector refuses ingest beyond its queue and size bounds and coun
 			maxPending: bounds.MOTEL_OTEL_MAX_PENDING_INGEST,
 			maxBytes: bounds.MOTEL_OTEL_MAX_INGEST_BYTES,
 			pending: 0,
-			refused: { queueFull: 1, tooLarge: 1 },
+			refused: { queueFull: 1, tooLarge: 1, invalid: 0, storeFailed: 0 },
 		})
 	} finally {
 		await collector.stop()
 		await rm(collector.directory, { recursive: true, force: true })
+	}
+}, 60_000)
+
+test("workerd collector counts malformed exports as final refusals and keeps its counts across restarts", async () => {
+	const first = await startCollector()
+	const malformed = JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{ traceId: 7 }] }] }] })
+	try {
+		const invalid = await post(first.origin, malformed)
+		// OTLP exporters retry 5xx and 429; a malformed export must not be retried.
+		expect(invalid.status).toBe(400)
+		const unparsable = await post(first.origin, "{")
+		expect(unparsable.status).toBe(400)
+		expect(await (await fetch(`${first.origin}/api/ingest`)).json()).toMatchObject({
+			refused: { queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0 },
+			refusedBytes: new TextEncoder().encode(malformed).byteLength + 1,
+		})
+	} finally {
+		await first.stop()
+	}
+	const second = await startCollector({}, first.directory)
+	try {
+		const status = (await (await fetch(`${second.origin}/api/ingest`)).json()) as { refused: unknown; lastRefusedAt: unknown }
+		expect(status.refused).toEqual({ queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0 })
+		expect(typeof status.lastRefusedAt).toBe("string")
+	} finally {
+		await second.stop()
+		await rm(first.directory, { recursive: true, force: true })
 	}
 }, 60_000)
