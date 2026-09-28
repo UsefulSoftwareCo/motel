@@ -1,9 +1,9 @@
 import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Context, Duration, Effect, Exit, Layer, Scope } from "effect"
+import { Duration, Effect, Exit, Layer, Scope } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
+import { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type { WorkerError } from "effect/unstable/workers/WorkerError"
+import { WorkerError } from "effect/unstable/workers/WorkerError"
 import { IngestRpcs } from "./ingestRpc.ts"
 
 import { AsyncIngest } from "./AsyncIngest.js"
@@ -39,14 +39,32 @@ export const AsyncIngestLive = Layer.effect(
 		// HTTP health wait for SQLite bootstrap. Managed readiness still verifies
 		// the worker through explicit ingest probes.
 		yield* Effect.forkScoped(getClient.pipe(Effect.ignore))
+		// Cancellation and payload errors belong to one request. Only a broken
+		// transport invalidates the worker shared by all ingest callers.
 		return {
 			ingestTraces: (input) =>
 				Effect.flatMap(getClient, ({ client, clientScope }) =>
-					client.ingestTraces(input).pipe(Effect.onError(() => Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient))),
+					client
+						.ingestTraces(input)
+						.pipe(
+							Effect.tapError((error) =>
+								error instanceof RpcClientError || error instanceof WorkerError
+									? Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)
+									: Effect.void,
+							),
+						),
 				),
 			ingestLogs: (input) =>
 				Effect.flatMap(getClient, ({ client, clientScope }) =>
-					client.ingestLogs(input).pipe(Effect.onError(() => Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient))),
+					client
+						.ingestLogs(input)
+						.pipe(
+							Effect.tapError((error) =>
+								error instanceof RpcClientError || error instanceof WorkerError
+									? Effect.andThen(Scope.close(clientScope, Exit.void), invalidateClient)
+									: Effect.void,
+							),
+						),
 				),
 		}
 	}),
