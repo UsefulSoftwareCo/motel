@@ -220,3 +220,57 @@ test("workerd stores and searches exports larger than one statement's parameters
 		await rm(directory, { recursive: true, force: true })
 	}
 }, 30000)
+
+test("workerd replaces a span an export sends again, keeping only its last listing", async () => {
+	const { directory, origin, start } = await prepareCollector()
+	const server = start()
+	const nano = (ms: number) => String(BigInt(ms) * 1000000n)
+	const trace = "00000000000000000000000000000abc"
+	const span = (spanId: string, name: string, stage: string) => ({
+		traceId: trace,
+		spanId,
+		name,
+		startTimeUnixNano: nano(Date.now() - 2),
+		endTimeUnixNano: nano(Date.now() - 1),
+		attributes: [{ key: "stage", value: { stringValue: stage } }],
+	})
+	const post = async (spans: unknown[]) => {
+		const response = await fetch(origin + "/v1/traces", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "workerd-replay" } }] }, scopeSpans: [{ spans }] }],
+			}),
+		})
+		expect(response.status).toBe(200)
+	}
+	const found = async (query: string) =>
+		((await (await fetch(`${origin}/api/spans/search?traceId=${trace}&${query}`)).json()) as { data: Array<{ span: { spanId: string } }> }).data.map(
+			(item) => item.span.spanId,
+		)
+	try {
+		for (let i = 0; i < 150; i++) {
+			if (await fetch(origin + "/api/health").then((response) => response.ok, () => false)) break
+			await Bun.sleep(100)
+		}
+		// A later export sends the span again.
+		const later = "000000000000000a"
+		await post([span(later, "replay alpha", "alpha")])
+		await post([span(later, "replay beta", "beta")])
+		expect(await found("operation=replay%20beta")).toEqual([later])
+		expect(await found("operation=replay%20alpha")).toEqual([])
+		expect(await found("attr.stage=beta")).toEqual([later])
+		expect(await found("attr.stage=alpha")).toEqual([])
+		// One export lists the span twice; the last listing is the span.
+		const twice = "000000000000000b"
+		await post([span(twice, "replay gamma", "gamma"), span(twice, "replay delta", "delta")])
+		expect(await found("operation=replay%20delta")).toEqual([twice])
+		expect(await found("operation=replay%20gamma")).toEqual([])
+		expect(await found("attr.stage=delta")).toEqual([twice])
+		expect(await found("attr.stage=gamma")).toEqual([])
+	} finally {
+		server.kill()
+		await server.exited
+		await rm(directory, { recursive: true, force: true })
+	}
+}, 30000)
