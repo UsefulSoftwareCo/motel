@@ -783,13 +783,17 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			transaction()
 		})
 
+		// A span is stored again only when an export repeats it. Its primary key finds it, so only then
+		// are its attribute rows and search entry replaced.
+		const spanExists = db.query(`SELECT 1 FROM spans WHERE trace_id = ? AND span_id = ?`)
 		const deleteSpanAttributes = db.query(`DELETE FROM span_attributes WHERE trace_id = ? AND span_id = ?`)
 		// Lists travel as one JSON parameter: workerd binds at most 100 parameters per statement.
-		const insertSpanAttributes = db.query(`INSERT INTO span_attributes (trace_id, span_id, key, value) SELECT ?, ?, key, value FROM json_each(?)`)
-		const insertSpanAttributesMany = (traceId: string, spanId: string, attributes: Readonly<Record<string, string>>) => {
-			if (Object.keys(attributes).length === 0) return
-			insertSpanAttributes.run(traceId, spanId, JSON.stringify(attributes))
-		}
+		const insertSpanAttributeRows = db.query(`
+			INSERT INTO span_attributes (trace_id, span_id, key, value)
+			SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?)
+		`)
+		// The search table cannot index its span columns, so this delete reads every entry. Run it
+		// only for spans an export stores again.
 		const deleteSpanOperationSearch = db.query(`
 			DELETE FROM span_operation_fts
 			WHERE (trace_id, span_id) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))
@@ -798,11 +802,13 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			INSERT INTO span_operation_fts (trace_id, span_id, operation_name)
 			SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?)
 		`)
-		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
+		const deleteSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
 			if (operations.length === 0) return
-			const list = JSON.stringify(operations)
-			deleteSpanOperationSearch.run(list)
-			insertSpanOperationSearch.run(list)
+			deleteSpanOperationSearch.run(JSON.stringify(operations))
+		}
+		const insertSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
+			if (operations.length === 0) return
+			insertSpanOperationSearch.run(JSON.stringify(operations))
 		}
 		const insertLogAttributes = db.query(`INSERT INTO log_attributes (log_id, key, value) SELECT ?, key, value FROM json_each(?)`)
 		const insertLogAttributesMany = (logId: number, attributes: Readonly<Record<string, string>>) => {
@@ -1049,7 +1055,10 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				let insertedSpans = 0
 				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
 					const touchedTraceIds = new Set<string>()
-					const touchedOperations: Array<readonly [string, string, string]> = []
+					let touchedOperations: Array<readonly [string, string, string]> = []
+					const replacedOperations: Array<readonly [string, string, string]> = []
+					// One statement stores the export's attribute rows.
+					let attributeRows: Array<readonly [string, string, string, string]> = []
 					for (const resourceSpans of request.resourceSpans ?? []) {
 						const resourceAttributes = attributeMap(resourceSpans.resource?.attributes)
 						const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
@@ -1072,6 +1081,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									attributes: attributeMap(event.attributes),
 								}))
 
+								const replaced = spanExists.get(traceId, spanId) !== null
 								insertSpan.run(
 									traceId,
 									spanId,
@@ -1088,18 +1098,30 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									JSON.stringify(resourceAttributes),
 									JSON.stringify(events),
 								)
-								deleteSpanAttributes.run(traceId, spanId)
-								insertSpanAttributesMany(traceId, spanId, mergedAttributes)
+								if (replaced) {
+									deleteSpanAttributes.run(traceId, spanId)
+									// The same export may have listed this span already; keep its last listing.
+									attributeRows = attributeRows.filter((row) => row[0] !== traceId || row[1] !== spanId)
+									touchedOperations = touchedOperations.filter((row) => row[0] !== traceId || row[1] !== spanId)
+									replacedOperations.push([traceId, spanId, span.name ?? "unknown"])
+								}
+								for (const key in mergedAttributes) attributeRows.push([traceId, spanId, key, mergedAttributes[key]!])
 								touchedOperations.push([traceId, spanId, span.name ?? "unknown"])
 								touchedTraceIds.add(traceId)
 								insertedSpans += 1
 							}
 						}
 					}
+					for (let offset = 0; offset < attributeRows.length; offset += 2000) {
+						insertSpanAttributeRows.run(JSON.stringify(attributeRows.slice(offset, offset + 2000)))
+					}
 					try {
 						const BATCH_SIZE = 500
+						for (let offset = 0; offset < replacedOperations.length; offset += BATCH_SIZE) {
+							deleteSpanOperationSearchMany(replacedOperations.slice(offset, offset + BATCH_SIZE))
+						}
 						for (let offset = 0; offset < touchedOperations.length; offset += BATCH_SIZE) {
-							updateSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
+							insertSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
 						}
 					} catch {
 						// FTS is optional.
