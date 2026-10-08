@@ -36,7 +36,10 @@ const bounds = {
 } as const
 
 /** Start the built worker; given the directory of a stopped collector, on that collector's store. */
-const startCollector = async (settings: Partial<Record<keyof typeof bounds, number>> = {}, reuse?: string) => {
+const startCollector = async (
+	settings: Partial<Record<keyof typeof bounds | "MOTEL_OTEL_EVICTION_LOW_WATER_PERCENT", number>> = {},
+	reuse?: string,
+) => {
 	const directory = reuse ?? (await mkdtemp(path.join(tmpdir(), "motel-bounds-")))
 	const port = await freePort()
 	const inspector = await freePort()
@@ -255,6 +258,38 @@ test("workerd collector keeps its database file within the size bound between re
 	// The file holds the stored telemetry and the pages it freed, which later exports reuse. It
 	// exceeds the bound by at most one export.
 	expect(peakFile).toBeLessThanOrEqual(4 * mebibyte + bounds.MOTEL_OTEL_MAX_INGEST_BYTES)
+	await rm(collector.directory, { recursive: true, force: true })
+}, 120_000)
+
+test("workerd collector evicts down to its low-water mark instead of once per export", async () => {
+	// Only the ingest path holds the bound here. Evicting back to exactly the bound leaves the
+	// store full, so every later export crossed it again and paid for another eviction pass.
+	const collector = await startCollector({
+		MOTEL_OTEL_MAX_SPANS: 10_000_000,
+		MOTEL_OTEL_MAX_DB_SIZE_MB: 4,
+		MOTEL_OTEL_EVICTION_LOW_WATER_PERCENT: 50,
+		MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600,
+	})
+	const exports = 120
+	let evictions: { passes: number; traces: number }
+	try {
+		for (let tick = 0; tick < exports; tick++) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(100)))
+			expect(response.status).toBe(200)
+			await response.arrayBuffer()
+		}
+		const status = (await (await fetch(`${collector.origin}/api/ingest`)).json()) as { evictions: typeof evictions }
+		evictions = status.evictions
+	} finally {
+		await collector.stop()
+	}
+	const stored = await storedTelemetry(collector.directory)
+	expect(stored.bytes).toBeLessThanOrEqual(4 * mebibyte)
+	// About 30 MiB arrive, a quarter MiB per export. Once full, each pass frees 2 MiB, room for
+	// about eight exports, so passes number about a ninth of the exports. One per export after
+	// the store first filled would be over a hundred.
+	expect(evictions.passes).toBeGreaterThan(0)
+	expect(evictions.passes).toBeLessThanOrEqual(exports / 4)
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
