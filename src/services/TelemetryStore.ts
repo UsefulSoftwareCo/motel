@@ -490,6 +490,8 @@ export class TelemetryStore extends Context.Service<
 		 * holds between retention passes rather than only after each. A no-op within the bound.
 		 */
 		readonly holdSizeBound: Effect.Effect<void, Error>
+		/** Retention passes that evicted traces since the store opened, and how many they evicted. */
+		readonly evictions: () => { readonly passes: number; readonly traces: number }
 	}
 >()("motel/TelemetryStore") {}
 
@@ -819,6 +821,13 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		}
 
 		const maxDbSizeBytes = config.otel.maxDbSizeMb * 1024 * 1024
+		const lowWaterBytes = Math.floor((maxDbSizeBytes * config.otel.evictionLowWaterPercent) / 100)
+		const lowWaterSpans = Math.floor((config.otel.maxSpans * config.otel.evictionLowWaterPercent) / 100)
+		// Set when a bound is exceeded and cleared at its low-water mark. Evicting only back to
+		// the bound itself left the store full, so the next export crossed it again and every
+		// export paid for a pass. A pass cut short by its time budget continues in the next one.
+		let draining = false
+		const evictions = { passes: 0, traces: 0 }
 
 		// Freelist-ratio thresholds for the adaptive reclaim loop. Below the
 		// LOW threshold there's nothing worth doing; above HIGH we are in the
@@ -861,6 +870,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				const passStarted = Date.now()
 				let spans = Number((db.query(`SELECT COALESCE(SUM(span_count), 0) AS value FROM trace_summaries`).get() as { value: number }).value)
 				let dbSize = db.usedBytes()
+				if (spans > config.otel.maxSpans || dbSize > maxDbSizeBytes) draining = true
+				const spanTarget = draining ? lowWaterSpans : config.otel.maxSpans
+				const sizeTarget = draining ? lowWaterBytes : maxDbSizeBytes
 				let evictedTraces = 0
 				let deletedLogs = false
 				let deletedOrphans = false
@@ -878,9 +890,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					// span; `usedBytes` ignores freed-but-not-vacuumed pages so a large
 					// freelist doesn't trigger a deletion death spiral.
 					const excess = Math.max(
-						spans - config.otel.maxSpans,
-						dbSize > maxDbSizeBytes && spans > 0 ? Math.ceil((dbSize - maxDbSizeBytes) / (dbSize / spans)) : 0,
-						dbSize > maxDbSizeBytes ? 1 : 0,
+						spans - spanTarget,
+						dbSize > sizeTarget && spans > 0 ? Math.ceil((dbSize - sizeTarget) / (dbSize / spans)) : 0,
+						dbSize > sizeTarget ? 1 : 0,
 					)
 					if (excess > 0) {
 						const oldest = db.query(
@@ -899,7 +911,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					// tying log eviction to trace_summaries lets those rows grow forever.
 					const expiredLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp_ms < ? ORDER BY timestamp_ms ASC LIMIT ?)`).run(cutoff, config.otel.retentionLogBatch)
 					let deletedLogsNow = Number(expiredLogs.changes) > 0
-					if (dbSize > maxDbSizeBytes) {
+					if (dbSize > sizeTarget) {
 						const oversizedLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY timestamp_ms ASC LIMIT ?)`).run(config.otel.retentionLogBatch)
 						deletedLogsNow = deletedLogsNow || Number(oversizedLogs.changes) > 0
 					}
@@ -940,10 +952,17 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					// Nothing left to evict, or every bound holds again.
 					if (toEvict.size === 0 && !deletedLogsNow) break
 					const backlog = timeExpired.length === config.otel.retentionTraceBatch || Number(expiredLogs.changes) === config.otel.retentionLogBatch
-					if (spans <= config.otel.maxSpans && dbSize <= maxDbSizeBytes && !backlog) break
+					if (spans <= spanTarget && dbSize <= sizeTarget && !backlog) break
 					// Some deletions free pages only after a later merge or checkpoint. When a
 					// pass freed nothing measurable, wait for that rather than evict more.
-					if (spans <= config.otel.maxSpans && !backlog && dbSize >= sizeBefore) break
+					if (spans <= spanTarget && !backlog && dbSize >= sizeBefore) break
+				}
+				// Stop draining at the low-water mark, or when nothing was left to evict: a store
+				// whose remaining traces are all still running waits for them to finish.
+				if ((spans <= lowWaterSpans && dbSize <= lowWaterBytes) || (evictedTraces === 0 && !deletedLogs)) draining = false
+				if (evictedTraces > 0) {
+					evictions.passes += 1
+					evictions.traces += evictedTraces
 				}
 
 				// Checkpoint after a big delete pass so the freed pages land
@@ -2401,6 +2420,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			getAiCall,
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
-			holdSizeBound: Effect.suspend(() => (db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
+			holdSizeBound: Effect.suspend(() => (draining || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
+			evictions: () => ({ ...evictions }),
 		})
 	})
