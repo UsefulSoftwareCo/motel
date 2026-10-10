@@ -1125,4 +1125,31 @@ describe("motel telemetry store", () => {
 
 		expect(services).toContain("active-child-only")
 	})
+
+	it("replaces a re-exported span's operation in the search index once", async () => {
+		const span = (name: string) => ({
+			resourceSpans: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "reexport" } }] },
+				scopeSpans: [{ spans: [{ traceId: "reexport-trace", spanId: "reexport-span", name, startTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n), endTimeUnixNano: String(BigInt(Date.now() + 1) * 1_000_000n) }] }],
+			}],
+		})
+		const search = (operation: string) =>
+			Effect.flatMap(TelemetryStore, (store) => store.searchSpans({ serviceName: "reexport", operation }))
+		const [first, again, renamed, previous] = await storeRuntime.runPromise(
+			Effect.gen(function* () {
+				const store = yield* TelemetryStore
+				yield* store.ingestTraces(span("reexport.first"))
+				const first = yield* search("reexport.first")
+				// An exporter resends an export the collector stored but did not acknowledge.
+				yield* store.ingestTraces(span("reexport.first"))
+				const again = yield* search("reexport.first")
+				yield* store.ingestTraces(span("reexport.renamed"))
+				return [first, again, yield* search("reexport.renamed"), yield* search("reexport.first")] as const
+			}).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+		expect(first).toHaveLength(1)
+		expect(again).toHaveLength(1)
+		expect(renamed.map((item) => item.span.operationName)).toEqual(["reexport.renamed"])
+		expect(previous).toHaveLength(0)
+	})
 })
