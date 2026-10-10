@@ -798,11 +798,16 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			INSERT INTO span_operation_fts (trace_id, span_id, operation_name)
 			SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?)
 		`)
-		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
-			if (operations.length === 0) return
-			const list = JSON.stringify(operations)
-			deleteSpanOperationSearch.run(list)
-			insertSpanOperationSearch.run(list)
+		// The operation index names its span only in UNINDEXED columns, so deleting by span scans
+		// the whole index. Only a span stored before has a row to replace; a new span, almost every
+		// one, is only inserted. Deleting for every span made each export cost time in proportion
+		// to everything already stored.
+		const spanExists = db.query(`SELECT 1 AS found FROM spans WHERE trace_id = ? AND span_id = ?`)
+		const deleteSpanOperationSearchMany = (spans: ReadonlyArray<readonly [string, string]>) => {
+			if (spans.length > 0) deleteSpanOperationSearch.run(JSON.stringify(spans))
+		}
+		const insertSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
+			if (operations.length > 0) insertSpanOperationSearch.run(JSON.stringify(operations))
 		}
 		const insertLogAttributes = db.query(`INSERT INTO log_attributes (log_id, key, value) SELECT ?, key, value FROM json_each(?)`)
 		const insertLogAttributesMany = (logId: number, attributes: Readonly<Record<string, string>>) => {
@@ -1050,6 +1055,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
 					const touchedTraceIds = new Set<string>()
 					const touchedOperations: Array<readonly [string, string, string]> = []
+					const replacedSpans: Array<readonly [string, string]> = []
 					for (const resourceSpans of request.resourceSpans ?? []) {
 						const resourceAttributes = attributeMap(resourceSpans.resource?.attributes)
 						const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
@@ -1072,6 +1078,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									attributes: attributeMap(event.attributes),
 								}))
 
+								if (spanExists.get(traceId, spanId) !== null) replacedSpans.push([traceId, spanId])
 								insertSpan.run(
 									traceId,
 									spanId,
@@ -1098,8 +1105,11 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					}
 					try {
 						const BATCH_SIZE = 500
+						for (let offset = 0; offset < replacedSpans.length; offset += BATCH_SIZE) {
+							deleteSpanOperationSearchMany(replacedSpans.slice(offset, offset + BATCH_SIZE))
+						}
 						for (let offset = 0; offset < touchedOperations.length; offset += BATCH_SIZE) {
-							updateSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
+							insertSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
 						}
 					} catch {
 						// FTS is optional.
