@@ -43,6 +43,9 @@ export const config = {
 		maxDbSizeMb: parsePositiveInt(process.env.MOTEL_OTEL_MAX_DB_SIZE_MB, 1024),
 		// Stored spans are also bounded by count, independent of their size on disk.
 		maxSpans: parsePositiveInt(process.env.MOTEL_OTEL_MAX_SPANS, 1_000_000),
+		// A store over its size or span bound evicts down to this percentage of it, so the
+		// exports after an eviction find room instead of each paying for another pass.
+		evictionLowWaterPercent: Math.min(100, parsePositiveInt(process.env.MOTEL_OTEL_EVICTION_LOW_WATER_PERCENT, 90)),
 		// One retention pass evicts until every bound holds, within this much writer time.
 		retentionPassBudgetMs: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_PASS_BUDGET_MS, 500),
 		// Exports the workerd collector reads at once, and the largest it accepts. Beyond

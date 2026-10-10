@@ -68,7 +68,9 @@ daemon is shared across local projects. No Docker, no cloud account.
 
 The store retains seven days of telemetry by default and targets a 1 GB
 active-data ceiling using bounded background batches. Recent data is preserved while
-the oldest completed traces and logs are removed first. Configure the policy
+the oldest completed traces and logs are removed first. Once the store exceeds its
+size or span ceiling, it evicts down to 90% of it (`MOTEL_OTEL_EVICTION_LOW_WATER_PERCENT`),
+so later exports do not each trigger another eviction. Configure the policy
 with `MOTEL_OTEL_RETENTION_HOURS`, `MOTEL_OTEL_MAX_DB_SIZE_MB`,
 `MOTEL_OTEL_RETENTION_TRACE_BATCH`, `MOTEL_OTEL_RETENTION_LOG_BATCH`, and
 `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`. Existing databases created without
