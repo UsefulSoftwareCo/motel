@@ -258,6 +258,55 @@ test("workerd collector keeps its database file within the size bound between re
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
+test("workerd collector at its size bound stores an idle trickle of exports without evicting for each", async () => {
+	// An idle product keeps exporting a small trace about once a second. Evicting back to exactly
+	// the bound left a full store over it again after every such export, so each one paid for an
+	// eviction pass and took the oldest trace with it.
+	const cap = 8
+	const collector = await startCollector({ MOTEL_OTEL_MAX_SPANS: 10_000_000, MOTEL_OTEL_MAX_DB_SIZE_MB: cap, MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600 })
+	const traceIds = async () => {
+		const store = path.join(collector.directory, "data", "motel")
+		const file = (await readdir(store).catch(() => [])).find((name) => name.endsWith(".sqlite") && name !== "metadata.sqlite")
+		if (file === undefined) return new Set<string>()
+		const database = new Database(path.join(store, file), { readonly: true })
+		try {
+			return new Set((database.query("SELECT trace_id FROM trace_summaries").all() as Array<{ trace_id: string }>).map((row) => row.trace_id))
+		} finally {
+			database.close()
+		}
+	}
+	let evictions: unknown
+	try {
+		// Fill until the store first evicts.
+		let sent = 0
+		while ((await traceIds()).size === sent) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(80)))
+			expect(response.status).toBe(200)
+			await response.arrayBuffer()
+			sent += 2
+		}
+		// The export that crossed the bound evicted down to the low-water mark, 90% by default.
+		expect((await storedTelemetry(collector.directory)).bytes).toBeLessThanOrEqual(cap * 0.9 * mebibyte)
+		const full = await traceIds()
+		// Twenty idle exports of one ten-span trace each, about half a MiB in all.
+		for (let tick = 0; tick < 20; tick++) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(10)))
+			expect(response.status).toBe(200)
+			await response.arrayBuffer()
+		}
+		const after = await traceIds()
+		expect([...full].filter((traceId) => !after.has(traceId))).toEqual([])
+		expect(after.size).toBe(full.size + 20)
+		evictions = ((await (await fetch(`${collector.origin}/api/ingest`)).json()) as { evictions: unknown }).evictions
+	} finally {
+		await collector.stop()
+	}
+	// One pass emptied the store to its low-water mark; none ran for the idle exports.
+	expect(evictions).toEqual({ passes: 1, traces: expect.any(Number) })
+	expect((await storedTelemetry(collector.directory)).bytes).toBeLessThanOrEqual(cap * mebibyte)
+	await rm(collector.directory, { recursive: true, force: true })
+}, 120_000)
+
 test("workerd collector refuses ingest beyond its queue and size bounds and counts what it refused", async () => {
 	const collector = await startCollector()
 	const held: Array<ReadableStreamDefaultController<Uint8Array>> = []
