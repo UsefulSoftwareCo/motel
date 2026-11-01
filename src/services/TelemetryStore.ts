@@ -831,7 +831,18 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		// Set when a bound is exceeded and cleared at its low-water mark. Evicting only back to
 		// the bound itself left the store full, so the next export crossed it again and every
 		// export paid for a pass. A pass cut short by its time budget continues in the next one.
-		let draining = false
+		// Stored, because at a large bound a drain takes several passes and the collector may be
+		// unloaded between them; read on first use, since only the writer evicts.
+		let draining: boolean | undefined
+		const isDraining = () => {
+			draining ??= (db.query(`SELECT value FROM motel_maintenance WHERE key = 'size_drain'`).get() as { value: string } | null)?.value === "1"
+			return draining
+		}
+		const setDraining = (next: boolean) => {
+			if (isDraining() === next) return
+			draining = next
+			db.query(`INSERT OR REPLACE INTO motel_maintenance(key, value) VALUES ('size_drain', ?)`).run(next ? "1" : "0")
+		}
 		const evictions = { passes: 0, traces: 0 }
 
 		// Freelist-ratio thresholds for the adaptive reclaim loop. Below the
@@ -875,9 +886,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				const passStarted = Date.now()
 				let spans = Number((db.query(`SELECT COALESCE(SUM(span_count), 0) AS value FROM trace_summaries`).get() as { value: number }).value)
 				let dbSize = db.usedBytes()
-				if (spans > config.otel.maxSpans || dbSize > maxDbSizeBytes) draining = true
-				const spanTarget = draining ? lowWaterSpans : config.otel.maxSpans
-				const sizeTarget = draining ? lowWaterBytes : maxDbSizeBytes
+				if (spans > config.otel.maxSpans || dbSize > maxDbSizeBytes) setDraining(true)
+				const spanTarget = isDraining() ? lowWaterSpans : config.otel.maxSpans
+				const sizeTarget = isDraining() ? lowWaterBytes : maxDbSizeBytes
 				let evictedTraces = 0
 				let deletedLogs = false
 				let deletedOrphans = false
@@ -964,7 +975,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				}
 				// Stop draining at the low-water mark, or when nothing was left to evict: a store
 				// whose remaining traces are all still running waits for them to finish.
-				if ((spans <= lowWaterSpans && dbSize <= lowWaterBytes) || (evictedTraces === 0 && !deletedLogs)) draining = false
+				if ((spans <= lowWaterSpans && dbSize <= lowWaterBytes) || (evictedTraces === 0 && !deletedLogs)) setDraining(false)
 				if (evictedTraces > 0) {
 					evictions.passes += 1
 					evictions.traces += evictedTraces
@@ -2430,7 +2441,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			getAiCall,
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
-			holdSizeBound: Effect.suspend(() => (draining || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
+			holdSizeBound: Effect.suspend(() => (isDraining() || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
 			evictions: () => ({ ...evictions }),
 		})
 	})
