@@ -126,7 +126,10 @@ export class MotelCollector {
 	/** Serve through the same typed HTTP routes as the native collector. */
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url)
-		if (request.method === "GET" && url.pathname === "/api/ingest") return Response.json(this.ingestStatus())
+		if (request.method === "GET" && url.pathname === "/api/ingest") {
+			const evictions = await this.store.then((store) => store.evictions(), () => null)
+			return Response.json({ ...this.ingestStatus(), evictions })
+		}
 		if (request.method === "POST" && ingestPaths.has(url.pathname)) return this.ingest(request)
 		return this.serve(request)
 	}
