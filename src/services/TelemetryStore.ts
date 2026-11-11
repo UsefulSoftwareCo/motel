@@ -156,6 +156,29 @@ type InternalTraceSpanItem = TraceSpanItem & {
 
 const isSpanRunning = (startTimeMs: number, endTimeMs: number) => endTimeMs <= 0 || endTimeMs < startTimeMs
 
+const storedSpanColumns = [
+	"parent_span_id",
+	"service_name",
+	"scope_name",
+	"operation_name",
+	"kind",
+	"start_time_ms",
+	"end_time_ms",
+	"status",
+	"attributes_json",
+	"resource_json",
+	"events_json",
+] as const
+
+/** Whether a stored span row already holds exactly these values, in `storedSpanColumns` order. */
+const sameStoredSpan = (stored: unknown, values: ReadonlyArray<string | number | null>) => {
+	const row = stored as Record<(typeof storedSpanColumns)[number], unknown>
+	return storedSpanColumns.every((column, index) => {
+		const value = row[column]
+		return (typeof value === "bigint" ? Number(value) : value) === values[index]
+	})
+}
+
 const liveDurationMs = (startTimeMs: number, endTimeMs: number, isRunning: boolean) =>
 	Math.max(0, (isRunning ? Date.now() : endTimeMs) - startTimeMs)
 
@@ -804,7 +827,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		// the whole index. Only a span stored before has a row to replace; a new span, almost every
 		// one, is only inserted. Deleting for every span made each export cost time in proportion
 		// to everything already stored.
-		const spanExists = db.query(`SELECT 1 AS found FROM spans WHERE trace_id = ? AND span_id = ?`)
+		const storedSpan = db.query(`SELECT ${storedSpanColumns.join(", ")} FROM spans WHERE trace_id = ? AND span_id = ?`)
 		const deleteSpanOperationSearchMany = (spans: ReadonlyArray<readonly [string, string]>) => {
 			if (spans.length > 0) deleteSpanOperationSearch.run(JSON.stringify(spans))
 		}
@@ -1108,10 +1131,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									attributes: attributeMap(event.attributes),
 								}))
 
-								if (spanExists.get(traceId, spanId) !== null) replacedSpans.push([traceId, spanId])
-								insertSpan.run(
-									traceId,
-									spanId,
+								const row = [
 									parentSpanId,
 									serviceName,
 									scopeName,
@@ -1119,11 +1139,36 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									spanKindLabel(span.kind),
 									startTimeMs,
 									endTimeMs,
-									Math.max(0, endTimeMs - startTimeMs),
 									spanStatusLabel(span.status?.code),
 									JSON.stringify(spanAttributes),
 									JSON.stringify(resourceAttributes),
 									JSON.stringify(events),
+								] as const
+								// An exporter resends an export the collector stored but did not acknowledge in
+								// time. Storing it again deleted and rewrote every row and index entry of each
+								// span, so a collector already too slow to answer got slower with each resend.
+								const stored = storedSpan.get(traceId, spanId)
+								if (stored !== null && sameStoredSpan(stored, row)) {
+									insertedSpans += 1
+									continue
+								}
+								if (stored !== null) replacedSpans.push([traceId, spanId])
+								const [parent, service, scope, operation, kind, start, end, status, attributesJson, resourceJson, eventsJson] = row
+								insertSpan.run(
+									traceId,
+									spanId,
+									parent,
+									service,
+									scope,
+									operation,
+									kind,
+									start,
+									end,
+									Math.max(0, end - start),
+									status,
+									attributesJson,
+									resourceJson,
+									eventsJson,
 								)
 								deleteSpanAttributes.run(traceId, spanId)
 								insertSpanAttributesMany(traceId, spanId, mergedAttributes)

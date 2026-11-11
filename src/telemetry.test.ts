@@ -1152,4 +1152,48 @@ describe("motel telemetry store", () => {
 		expect(renamed.map((item) => item.span.operationName)).toEqual(["reexport.renamed"])
 		expect(previous).toHaveLength(0)
 	})
+
+	it("stores an identical resent export without rewriting its rows", async () => {
+		const now = BigInt(Date.now()) * 1_000_000n
+		const span = (spanId: string, offset: bigint) => ({
+			traceId: "resent-trace",
+			spanId,
+			name: `resent.${spanId}`,
+			startTimeUnixNano: String(now + offset),
+			endTimeUnixNano: String(now + offset + 5_000_000n),
+			attributes: [{ key: "resent.key", value: { stringValue: spanId } }],
+		})
+		const exported = {
+			resourceSpans: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "resent" } }] },
+				scopeSpans: [{ spans: [span("resent-a", 0n), span("resent-b", 1_000_000n)] }],
+			}],
+		}
+		const rows = () => {
+			const probe = new Database(dbPath, { readonly: true })
+			try {
+				return {
+					spans: probe.query(`SELECT rowid, span_id FROM spans WHERE trace_id = 'resent-trace' ORDER BY span_id`).all(),
+					attributes: probe.query(`SELECT rowid, span_id, key FROM span_attributes WHERE trace_id = 'resent-trace' ORDER BY span_id, key`).all(),
+				}
+			} finally {
+				probe.close()
+			}
+		}
+		const [first, again] = await storeRuntime.runPromise(
+			Effect.gen(function* () {
+				const store = yield* TelemetryStore
+				const first = yield* store.ingestTraces(exported)
+				const before = rows()
+				// The exporter timed out waiting for the acknowledgement and sends the same export again.
+				const again = yield* store.ingestTraces(exported)
+				return [{ result: first, rows: before }, { result: again, rows: rows() }] as const
+			}).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+		expect(first.result).toEqual({ insertedSpans: 2 })
+		expect(again.result).toEqual({ insertedSpans: 2 })
+		expect(first.rows.attributes.length).toBeGreaterThan(0)
+		// Same rows, not deleted and inserted again.
+		expect(again.rows).toEqual(first.rows)
+	})
 })
