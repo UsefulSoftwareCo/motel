@@ -513,12 +513,6 @@ export class TelemetryStore extends Context.Service<
 		 * holds between retention passes rather than only after each. A no-op within the bound.
 		 */
 		readonly holdSizeBound: Effect.Effect<void, Error>
-		/**
-		 * Whether the store has room for another export: within `MOTEL_OTEL_MAX_DB_SIZE_MB`, or
-		 * back within it after one eviction pass. An export that finds no room is refused, so
-		 * ingest faster than eviction cannot grow the store past its bound.
-		 */
-		readonly makeRoom: Effect.Effect<boolean, Error>
 		/** Retention passes that evicted traces since the store opened, and how many they evicted. */
 		readonly evictions: () => { readonly passes: number; readonly traces: number }
 	}
@@ -542,6 +536,21 @@ export class TelemetryStore extends Context.Service<
 export interface TelemetryStoreOptions {
 	readonly readonly: boolean
 	readonly runRetention: boolean
+	/**
+	 * Refuse an export, with `StoreOverBound`, while the store is over `MOTEL_OTEL_MAX_DB_SIZE_MB`
+	 * after one eviction pass, instead of storing it. Set by the workerd collector, which answers
+	 * the refusal with 429 and Retry-After; the native daemon holds its bound with its retention
+	 * loop and stores every export, as before.
+	 */
+	readonly refuseOverBound?: boolean
+}
+
+/** An export the store refused because it is over its size bound and eviction has not caught up. */
+export class StoreOverBound extends Error {
+	readonly _tag = "StoreOverBound"
+	constructor() {
+		super("Telemetry store is over its size bound")
+	}
 }
 
 /** Construct the shared query and ingest logic over an owned SQLite connection. */
@@ -909,8 +918,8 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				//
 				// A pass evicts batches until the store is back within its age, span-count and
 				// size bounds or its time budget runs out; the next pass continues from there.
-				// Exports cannot outgrow the size bound meanwhile: `makeRoom` refuses them while
-				// the store is still over it.
+				// With `refuseOverBound`, exports cannot outgrow the size bound meanwhile: the store
+				// refuses them while it is still over it.
 				const passStarted = Date.now()
 				let spans = Number((db.query(`SELECT COALESCE(SUM(span_count), 0) AS value FROM trace_summaries`).get() as { value: number }).value)
 				let dbSize = db.usedBytes()
@@ -934,11 +943,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					swept = true
 					const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
 					deletedOrphans = deletedOrphans || Number(orphanAttributes.changes) > 0
-					try {
+					if (hasFts) {
 						const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
 						deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
-					} catch {
-						// FTS table may not exist on old DBs.
 					}
 				}
 				while (Date.now() - passStarted < config.otel.retentionPassBudgetMs) {
@@ -979,6 +986,18 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						).all(config.otel.retentionTraceBatch) as readonly { trace_id: string; span_count: number }[]
 						for (const row of oldest) {
 							if (batchSpans >= excess || !take(row)) break
+						}
+						// The size bound wins over keeping running traces whole. A store over its bound
+						// whose every trace still has a running span would otherwise evict nothing, and
+						// with exports refused while it is over, the spans that would end those traces
+						// could never arrive.
+						if (toEvict.size === 0 && dbSize > maxDbSizeBytes) {
+							const running = db.query(
+								`SELECT trace_id, span_count FROM trace_summaries ORDER BY started_at_ms ASC LIMIT ?`,
+							).all(config.otel.retentionTraceBatch) as readonly { trace_id: string; span_count: number }[]
+							for (const row of running) {
+								if (batchSpans >= excess || !take(row)) break
+							}
 						}
 					}
 
@@ -1026,12 +1045,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				}
 				// The operation index names its trace only in an UNINDEXED column, so a delete from it
 				// reads the whole index; one delete covers every trace this pass evicted.
-				if (evictedTraceIds.length > 0) {
-					try {
-						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(JSON.stringify(evictedTraceIds))
-					} catch {
-						// FTS table may not exist on old DBs.
-					}
+				// A failure here fails the pass, and its transaction leaves nothing half-deleted.
+				if (evictedTraceIds.length > 0 && hasFts) {
+					db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(JSON.stringify(evictedTraceIds))
 				}
 				// A pass whose batches deleted no logs still sweeps once, for orphans left by anything else.
 				if (!swept) sweepOrphans()
@@ -1158,8 +1174,17 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			if (opts.runRetention) yield* Effect.forkScoped(backfillAttrFts)
 		}
 
+		// Every stored export passes through `ingestTraces` or `ingestLogs`, whichever route or
+		// path spelling it arrived by, so the size bound is held here. The last check and the
+		// write run in one synchronous step, so no other export can be stored between them, and
+		// the store exceeds its bound by at most the rows one export writes.
+		const overBound = () => opts.refuseOverBound === true && db.usedBytes() > maxDbSizeBytes
+		const makeRoom = Effect.suspend(() => (overBound() ? cleanupExpired() : Effect.void))
+
 		const ingestTraces = Effect.fn("motel/TelemetryStore.ingestTraces")(function* (payload: OtlpTraceExportRequest) {
-			return yield* Effect.sync(() => {
+			yield* makeRoom
+			const stored = yield* Effect.sync(() => {
+				if (overBound()) return null
 				let insertedSpans = 0
 				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
 					const touchedTraceIds = new Set<string>()
@@ -1255,10 +1280,14 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				transaction(payload)
 				return { insertedSpans }
 			})
+			if (stored === null) return yield* Effect.fail(new StoreOverBound())
+			return stored
 		})
 
 		const ingestLogs = Effect.fn("motel/TelemetryStore.ingestLogs")(function* (payload: OtlpLogExportRequest) {
-			return yield* Effect.sync(() => {
+			yield* makeRoom
+			const stored = yield* Effect.sync(() => {
+				if (overBound()) return null
 				let insertedLogs = 0
 				const transaction = db.transaction((request: OtlpLogExportRequest) => {
 					const touchedLogBodies: Array<readonly [string, string]> = []
@@ -1307,6 +1336,8 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				transaction(payload)
 				return { insertedLogs }
 			})
+			if (stored === null) return yield* Effect.fail(new StoreOverBound())
+			return stored
 		})
 
 		const listServices = Effect.fn("motel/TelemetryStore.listServices")(function* () {
@@ -2545,9 +2576,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
 			holdSizeBound: Effect.suspend(() => (isDraining() || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
-			makeRoom: Effect.suspend(() =>
-				db.usedBytes() <= maxDbSizeBytes ? Effect.succeed(true) : Effect.map(cleanupExpired(), () => db.usedBytes() <= maxDbSizeBytes),
-			),
+
 			evictions: () => ({ ...evictions }),
 		})
 	})

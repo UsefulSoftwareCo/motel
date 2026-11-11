@@ -325,8 +325,14 @@ test("workerd collector holds its size bound under ingest faster than its capped
 	let refused = 0
 	let status: { refused: Record<string, number>; evictions: { passes: number } }
 	try {
+		// Any spelling of the ingest path the collector stores from is held to the same bound.
+		const paths = ["/v1/traces", "/v1/Traces", "/v1/%74races", "//v1/traces/"]
 		for (let tick = 0; tick < 100; tick++) {
-			const response = await post(collector.origin, JSON.stringify(traceExport(400)))
+			const response = await fetch(`${collector.origin}${paths[tick % paths.length]}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(traceExport(400)),
+			})
 			await response.arrayBuffer()
 			if (response.status === 429) {
 				expect(response.headers.get("retry-after")).toBe("1")
@@ -344,6 +350,39 @@ test("workerd collector holds its size bound under ingest faster than its capped
 	expect(status.evictions.passes).toBeGreaterThan(0)
 	expect(refused).toBeGreaterThan(0)
 	expect(status.refused.overBound).toBe(refused)
+	await rm(collector.directory, { recursive: true, force: true })
+}, 120_000)
+
+test("workerd collector over its bound with only running traces evicts them rather than refuse every export", async () => {
+	// Eviction keeps running traces whole, but the size bound comes first: a store filled with
+	// traces whose spans have not ended would otherwise evict nothing, refuse every export, and
+	// never receive the spans that end those traces.
+	const cap = 4
+	const collector = await startCollector({ MOTEL_OTEL_MAX_SPANS: 10_000_000, MOTEL_OTEL_MAX_DB_SIZE_MB: cap, MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600 })
+	const running = (spans: number) => {
+		const exported = traceExport(spans)
+		for (const span of exported.resourceSpans[0]!.scopeSpans[0]!.spans as Array<{ endTimeUnixNano: string }>) span.endTimeUnixNano = "0"
+		return exported
+	}
+	let accepted = 0
+	try {
+		// Fill past the bound with running traces only.
+		for (let tick = 0; tick < 40; tick++) {
+			const response = await post(collector.origin, JSON.stringify(running(400)))
+			await response.arrayBuffer()
+		}
+		// Completed exports are stored again once eviction has made room.
+		for (let tick = 0; tick < 20; tick++) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(400)))
+			await response.arrayBuffer()
+			if (response.status === 200) accepted += 1
+			else expect(response.status).toBe(429)
+		}
+	} finally {
+		await collector.stop()
+	}
+	expect(accepted).toBeGreaterThan(0)
+	expect((await storedTelemetry(collector.directory)).bytes).toBeLessThanOrEqual(cap * mebibyte + bounds.MOTEL_OTEL_MAX_INGEST_BYTES)
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 

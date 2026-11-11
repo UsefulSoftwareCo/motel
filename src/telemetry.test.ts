@@ -1219,6 +1219,72 @@ describe("motel telemetry store", () => {
 		}
 	})
 
+	it("fails and rolls back a retention pass whose search-index delete fails", async () => {
+		// The pass's delete from the operation index used to swallow any error, so the spans' deletion
+		// was kept and their index rows were left for good.
+		const path = join(tempDir, "failed-index-delete.sqlite")
+		const sqlite = new Database(path)
+		let armed = false
+		const database = {
+			exec: (sql: string) => {
+				sqlite.exec(sql)
+			},
+			query: (sql: string) => {
+				const statement = sqlite.query(sql)
+				if (!sql.startsWith("DELETE FROM span_operation_fts WHERE trace_id IN")) return statement
+				return { ...statement, all: statement.all.bind(statement), get: statement.get.bind(statement), run: (...values: Array<never>) => {
+					if (armed) throw new Error("injected index failure")
+					return statement.run(...values)
+				} }
+			},
+			transaction: <A extends unknown[], B>(run: (...args: A) => B) => sqlite.transaction(run) as (...args: A) => B,
+			usedBytes: () => {
+				const one = (name: string) => Number(Object.values(sqlite.query(`PRAGMA ${name}`).get() as object)[0])
+				return (one("page_count") - one("freelist_count")) * one("page_size")
+			},
+			reclaim: () => {},
+			checkpoint: () => {},
+			optimize: () => {},
+		}
+		const old = BigInt(Date.now() - 48 * 60 * 60 * 1000) * 1_000_000n
+		const counts = () => ({
+			spans: (sqlite.query(`SELECT COUNT(*) AS c FROM spans WHERE trace_id = 'failed-index-trace'`).get() as { c: number }).c,
+			search: (sqlite.query(`SELECT COUNT(*) AS c FROM span_operation_fts WHERE trace_id = 'failed-index-trace'`).get() as { c: number }).c,
+		})
+		try {
+			const [failed, afterFailure, afterRetry] = await Effect.runPromise(
+				Effect.scoped(
+					Effect.gen(function* () {
+						const store = yield* makeTelemetryStoreEffect(database as never, { readonly: false, runRetention: false })
+						yield* store.ingestTraces({
+							resourceSpans: [{
+								resource: { attributes: [{ key: "service.name", value: { stringValue: "failed-index" } }] },
+								scopeSpans: [{ spans: ["a", "b"].map((id, index) => ({
+									traceId: "failed-index-trace",
+									spanId: `failed-index-${id}`,
+									name: `failed.index.${id}`,
+									startTimeUnixNano: String(old + BigInt(index) * 1_000_000n),
+									endTimeUnixNano: String(old + BigInt(index + 1) * 1_000_000n),
+								})) }],
+							}],
+						})
+						armed = true
+						const failed = yield* Effect.exit(store.runRetentionNow)
+						const afterFailure = counts()
+						armed = false
+						yield* store.runRetentionNow
+						return [failed._tag, afterFailure, counts()] as const
+					}),
+				).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+			)
+			expect(failed).toBe("Failure")
+			expect(afterFailure).toEqual({ spans: 2, search: 2 })
+			expect(afterRetry).toEqual({ spans: 0, search: 0 })
+		} finally {
+			sqlite.close()
+		}
+	})
+
 	it("stores an identical resent export without rewriting its rows", async () => {
 		const now = BigInt(Date.now()) * 1_000_000n
 		const span = (spanId: string, offset: bigint) => ({
