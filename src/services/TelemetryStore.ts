@@ -921,12 +921,26 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				let deletedLogs = false
 				let deletedOrphans = false
 				// What a pass costs: batches until the budget runs out, checked between batches, so
-				// the budget plus one batch; then one delete from the operation index for everything
-				// it evicted, which reads that whole index, and the two log orphan sweeps, which read
-				// theirs. A batch holds at most `retentionSpanBatch` spans, except that its first trace
+				// the budget plus one batch, where a batch that deleted logs includes the two log
+				// orphan sweeps, which read their whole tables; then one delete from the operation
+				// index for everything it evicted, which reads that whole index. A batch holds at most `retentionSpanBatch` spans, except that its first trace
 				// is always taken whole, however large. Nothing here bounds the index scan or a single
 				// very large trace by time.
 				const evictedTraceIds: Array<string> = []
+				// Log-side orphans (log_attributes + FTS) are keyed by log.id, so prune what no longer
+				// has a parent log row. Each sweep reads its whole table.
+				let swept = false
+				const sweepOrphans = () => {
+					swept = true
+					const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
+					deletedOrphans = deletedOrphans || Number(orphanAttributes.changes) > 0
+					try {
+						const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
+						deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
+					} catch {
+						// FTS table may not exist on old DBs.
+					}
+				}
 				while (Date.now() - passStarted < config.otel.retentionPassBudgetMs) {
 					const toEvict = new Map<string, number>()
 					// Spans in this batch: it stops before a trace that would take it past
@@ -977,7 +991,6 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						const oversizedLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY timestamp_ms ASC LIMIT ?)`).run(config.otel.retentionLogBatch)
 						deletedLogsNow = deletedLogsNow || Number(oversizedLogs.changes) > 0
 					}
-					deletedLogs = deletedLogs || deletedLogsNow
 
 					// Each batch wipes every row reachable from those trace_ids
 					// across the cascade tables.
@@ -988,11 +1001,16 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						db.query(`DELETE FROM span_attributes WHERE trace_id IN ${jsonValues}`).run(batch)
 						db.query(`DELETE FROM spans WHERE trace_id IN ${jsonValues}`).run(batch)
 						const tracedLogs = db.query(`DELETE FROM logs WHERE trace_id IN ${jsonValues}`).run(batch)
-						deletedLogs = deletedLogs || Number(tracedLogs.changes) > 0
+						deletedLogsNow = deletedLogsNow || Number(tracedLogs.changes) > 0
 						db.query(`DELETE FROM trace_summaries WHERE trace_id IN ${jsonValues}`).run(batch)
 					}
 
 					evictedTraceIds.push(...traceIds)
+					deletedLogs = deletedLogs || deletedLogsNow
+					// A deleted log's attributes and body index rows are most of its size, and only the
+					// orphan sweeps remove them, so a batch that deleted logs sweeps before it measures
+					// the store; otherwise the pass would see no room freed and delete every log.
+					if (deletedLogsNow) sweepOrphans()
 
 					for (const count of toEvict.values()) spans -= count
 					evictedTraces += toEvict.size
@@ -1015,16 +1033,8 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						// FTS table may not exist on old DBs.
 					}
 				}
-				// Log-side orphans (log_attributes + FTS) are keyed by log.id, so prune what no longer
-				// has a parent log row. Each sweep reads its whole table, once a pass.
-				const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
-				deletedOrphans = Number(orphanAttributes.changes) > 0
-				try {
-					const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
-					deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
-				} catch {
-					// FTS table may not exist on old DBs.
-				}
+				// A pass whose batches deleted no logs still sweeps once, for orphans left by anything else.
+				if (!swept) sweepOrphans()
 
 				// Stop draining at the low-water mark, or when nothing was left to evict: a store
 				// whose remaining traces are all still running waits for them to finish.
