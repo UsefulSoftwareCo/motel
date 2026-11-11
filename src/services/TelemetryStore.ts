@@ -513,6 +513,12 @@ export class TelemetryStore extends Context.Service<
 		 * holds between retention passes rather than only after each. A no-op within the bound.
 		 */
 		readonly holdSizeBound: Effect.Effect<void, Error>
+		/**
+		 * Whether the store has room for another export: within `MOTEL_OTEL_MAX_DB_SIZE_MB`, or
+		 * back within it after one eviction pass. An export that finds no room is refused, so
+		 * ingest faster than eviction cannot grow the store past its bound.
+		 */
+		readonly makeRoom: Effect.Effect<boolean, Error>
 		/** Retention passes that evicted traces since the store opened, and how many they evicted. */
 		readonly evictions: () => { readonly passes: number; readonly traces: number }
 	}
@@ -892,7 +898,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
 
-			yield* Effect.sync(() => {
+			const pass = () => {
 				const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
 
 				// Evict at TRACE granularity so we never leave a trace half-gutted
@@ -901,11 +907,10 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				// are protected — only `active_span_count = 0` summaries are in
 				// scope for eviction.
 				//
-				// Every bound holds after each pass, not eventually: one pass evicts
-				// batches until the store is back within its age, span-count and size
-				// bounds, so a sustained ingest rate above one batch per interval
-				// cannot outgrow them. A time budget keeps the pass from holding the
-				// single writer for long; the next interval continues from there.
+				// A pass evicts batches until the store is back within its age, span-count and
+				// size bounds or its time budget runs out; the next pass continues from there.
+				// Exports cannot outgrow the size bound meanwhile: `makeRoom` refuses them while
+				// the store is still over it.
 				const passStarted = Date.now()
 				let spans = Number((db.query(`SELECT COALESCE(SUM(span_count), 0) AS value FROM trace_summaries`).get() as { value: number }).value)
 				let dbSize = db.usedBytes()
@@ -915,9 +920,12 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				let evictedTraces = 0
 				let deletedLogs = false
 				let deletedOrphans = false
-				// The budget is checked between batches, so a pass holds the writer for at most the
-				// budget plus one batch, and a batch is bounded by `retentionSpanBatch` spans. Deletes
-				// that scan a whole table run once per pass, after its batches, not once per batch.
+				// What a pass costs: batches until the budget runs out, checked between batches, so
+				// the budget plus one batch; then one delete from the operation index for everything
+				// it evicted, which reads that whole index, and the two log orphan sweeps, which read
+				// theirs. A batch holds at most `retentionSpanBatch` spans, except that its first trace
+				// is always taken whole, however large. Nothing here bounds the index scan or a single
+				// very large trace by time.
 				const evictedTraceIds: Array<string> = []
 				while (Date.now() - passStarted < config.otel.retentionPassBudgetMs) {
 					const toEvict = new Map<string, number>()
@@ -979,7 +987,8 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						const batch = JSON.stringify(traceIds.slice(offset, offset + BATCH_SIZE))
 						db.query(`DELETE FROM span_attributes WHERE trace_id IN ${jsonValues}`).run(batch)
 						db.query(`DELETE FROM spans WHERE trace_id IN ${jsonValues}`).run(batch)
-						db.query(`DELETE FROM logs WHERE trace_id IN ${jsonValues}`).run(batch)
+						const tracedLogs = db.query(`DELETE FROM logs WHERE trace_id IN ${jsonValues}`).run(batch)
+						deletedLogs = deletedLogs || Number(tracedLogs.changes) > 0
 						db.query(`DELETE FROM trace_summaries WHERE trace_id IN ${jsonValues}`).run(batch)
 					}
 
@@ -997,19 +1006,19 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					// pass freed nothing measurable, wait for that rather than evict more.
 					if (spans <= spanTarget && !backlog && dbSize >= sizeBefore) break
 				}
-				// The operation index names its trace only in an UNINDEXED column, so each delete from
-				// it reads the whole index; one runs for all the traces this pass evicted.
-				for (let offset = 0; offset < evictedTraceIds.length; offset += 500) {
+				// The operation index names its trace only in an UNINDEXED column, so a delete from it
+				// reads the whole index; one delete covers every trace this pass evicted.
+				if (evictedTraceIds.length > 0) {
 					try {
-						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(JSON.stringify(evictedTraceIds.slice(offset, offset + 500)))
+						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(JSON.stringify(evictedTraceIds))
 					} catch {
 						// FTS table may not exist on old DBs.
 					}
 				}
-				// Log-side orphans (log_attributes + FTS) are keyed by log.id,
-				// so prune what no longer has a parent log row.
+				// Log-side orphans (log_attributes + FTS) are keyed by log.id, so prune what no longer
+				// has a parent log row. Each sweep reads its whole table, once a pass.
 				const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
-				deletedOrphans = deletedOrphans || Number(orphanAttributes.changes) > 0
+				deletedOrphans = Number(orphanAttributes.changes) > 0
 				try {
 					const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
 					deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
@@ -1020,11 +1029,27 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				// Stop draining at the low-water mark, or when nothing was left to evict: a store
 				// whose remaining traces are all still running waits for them to finish.
 				if ((spans <= lowWaterSpans && dbSize <= lowWaterBytes) || (evictedTraces === 0 && !deletedLogs)) setDraining(false)
-				if (evictedTraces > 0) {
-					evictions.passes += 1
-					evictions.traces += evictedTraces
-				}
+				return { evictedTraces, deletedLogs, deletedOrphans }
+			}
 
+			// The pass's deletes commit together: a failure part-way through, after a batch's
+			// spans are gone but before their operation-index rows are, must not leave index rows
+			// for spans that no longer exist. workerd commits a synchronous run of writes
+			// atomically already; the native store needs the transaction.
+			const { evictedTraces, deletedLogs, deletedOrphans } = yield* Effect.try({
+				try: () => db.transaction(pass)(),
+				catch: (cause) => {
+					// The drain flag is cached; re-read what the rolled-back transaction left.
+					draining = undefined
+					return cause instanceof Error ? cause : new Error(String(cause))
+				},
+			})
+			if (evictedTraces > 0) {
+				evictions.passes += 1
+				evictions.traces += evictedTraces
+			}
+
+			yield* Effect.sync(() => {
 				// Checkpoint after a big delete pass so the freed pages land
 				// in the main DB file and become eligible for incremental
 				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
@@ -2510,6 +2535,9 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
 			holdSizeBound: Effect.suspend(() => (isDraining() || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
+			makeRoom: Effect.suspend(() =>
+				db.usedBytes() <= maxDbSizeBytes ? Effect.succeed(true) : Effect.map(cleanupExpired(), () => db.usedBytes() <= maxDbSizeBytes),
+			),
 			evictions: () => ({ ...evictions }),
 		})
 	})

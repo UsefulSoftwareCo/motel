@@ -51,8 +51,8 @@ const boundedText = async (request: Request, limit: number): Promise<string | un
 }
 
 /** Why the collector did not store an export. Each is counted; see `MotelCollector.ingestStatus`. */
-type Loss = "queueFull" | "tooLarge" | "invalid" | "storeFailed"
-const losses: ReadonlyArray<Loss> = ["queueFull", "tooLarge", "invalid", "storeFailed"]
+type Loss = "queueFull" | "tooLarge" | "invalid" | "storeFailed" | "overBound"
+const losses: ReadonlyArray<Loss> = ["queueFull", "tooLarge", "invalid", "storeFailed", "overBound"]
 interface LossCounts {
 	/** Exports not stored, by reason. */
 	readonly refused: Record<Loss, number>
@@ -209,6 +209,12 @@ export class MotelCollector {
 		try {
 			if ((await this.state.storage.getAlarm()) === null) {
 				await this.state.storage.setAlarm(Date.now() + config.otel.retentionIntervalSeconds * 1000)
+			}
+			// A store still over its size bound after an eviction pass takes nothing more until
+			// eviction catches up. Storing anyway let ingest faster than eviction grow the store
+			// without limit; refused, the exporter resends after Retry-After or drops the batch.
+			if (!(await Effect.runPromise(store.makeRoom))) {
+				return this.refuse("overBound", bytes, "Collector store is over its size bound", 429, { "retry-after": "1" })
 			}
 			// Each export is stored before the response, then the size bound is held again.
 			const result = await Effect.runPromise(Effect.tap(stored, () => store.holdSizeBound))

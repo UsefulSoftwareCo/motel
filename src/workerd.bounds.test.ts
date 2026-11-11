@@ -308,33 +308,42 @@ test("workerd collector at its size bound stores an idle trickle of exports with
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
-test("workerd collector evicts a full store of large traces in batches bounded by spans", async () => {
-	// One eviction batch is one uninterrupted run of deletes that every export waits behind. A
-	// batch of the 100 oldest traces held the collector for seconds once traces were large, so
-	// exports timed out, were sent again, and the resends made the store slower still.
-	// With a one-millisecond budget each pass runs exactly one batch.
+test("workerd collector holds its size bound under ingest faster than its capped eviction passes", async () => {
+	// One eviction batch is one uninterrupted run of deletes that every export waits behind, so a
+	// batch is capped by spans and a pass by time. Exports can then arrive faster than a pass
+	// evicts. Stored anyway, they grew the store past its bound without limit; the collector must
+	// refuse them until eviction catches up. A one-millisecond budget makes each pass one batch of
+	// at most 200 spans, five of these 40-span traces, against exports of ten traces.
+	const cap = 4
 	const collector = await startCollector({
 		MOTEL_OTEL_MAX_SPANS: 10_000_000,
-		MOTEL_OTEL_MAX_DB_SIZE_MB: 4,
+		MOTEL_OTEL_MAX_DB_SIZE_MB: cap,
 		MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600,
 		MOTEL_OTEL_RETENTION_PASS_BUDGET_MS: 1,
 		MOTEL_OTEL_RETENTION_SPAN_BATCH: 200,
 	})
-	let evictions = { passes: 0, traces: 0 }
+	let refused = 0
+	let status: { refused: Record<string, number>; evictions: { passes: number } }
 	try {
-		// Exports of ten 40-span traces until the store has evicted for a while.
-		for (let tick = 0; tick < 200 && evictions.passes < 20; tick++) {
+		for (let tick = 0; tick < 100; tick++) {
 			const response = await post(collector.origin, JSON.stringify(traceExport(400)))
-			expect(response.status).toBe(200)
 			await response.arrayBuffer()
-			evictions = ((await (await fetch(`${collector.origin}/api/ingest`)).json()) as { evictions: typeof evictions }).evictions
+			if (response.status === 429) {
+				expect(response.headers.get("retry-after")).toBe("1")
+				refused += 1
+			} else expect(response.status).toBe(200)
 		}
+		status = (await (await fetch(`${collector.origin}/api/ingest`)).json()) as typeof status
 	} finally {
 		await collector.stop()
 	}
-	expect(evictions.passes).toBeGreaterThanOrEqual(20)
-	// 200 spans is five 40-span traces.
-	expect(evictions.traces).toBeLessThanOrEqual(evictions.passes * 5)
+	// One sequential export at a time can find room just under the bound, so the store exceeds
+	// it by at most what one export stores.
+	const stored = await storedTelemetry(collector.directory)
+	expect(stored.bytes).toBeLessThanOrEqual(cap * mebibyte + bounds.MOTEL_OTEL_MAX_INGEST_BYTES)
+	expect(status.evictions.passes).toBeGreaterThan(0)
+	expect(refused).toBeGreaterThan(0)
+	expect(status.refused.overBound).toBe(refused)
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
@@ -374,7 +383,7 @@ test("workerd collector refuses ingest beyond its queue and size bounds and coun
 			maxPending: bounds.MOTEL_OTEL_MAX_PENDING_INGEST,
 			maxBytes: bounds.MOTEL_OTEL_MAX_INGEST_BYTES,
 			pending: 0,
-			refused: { queueFull: 1, tooLarge: 1, invalid: 0, storeFailed: 0 },
+			refused: { queueFull: 1, tooLarge: 1, invalid: 0, storeFailed: 0, overBound: 0 },
 		})
 	} finally {
 		await collector.stop()
@@ -392,7 +401,7 @@ test("workerd collector counts malformed exports as final refusals and keeps its
 		const unparsable = await post(first.origin, "{")
 		expect(unparsable.status).toBe(400)
 		expect(await (await fetch(`${first.origin}/api/ingest`)).json()).toMatchObject({
-			refused: { queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0 },
+			refused: { queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0, overBound: 0 },
 			refusedBytes: new TextEncoder().encode(malformed).byteLength + 1,
 		})
 	} finally {
@@ -401,7 +410,7 @@ test("workerd collector counts malformed exports as final refusals and keeps its
 	const second = await startCollector({}, first.directory)
 	try {
 		const status = (await (await fetch(`${second.origin}/api/ingest`)).json()) as { refused: unknown; lastRefusedAt: unknown }
-		expect(status.refused).toEqual({ queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0 })
+		expect(status.refused).toEqual({ queueFull: 0, tooLarge: 0, invalid: 2, storeFailed: 0, overBound: 0 })
 		expect(typeof status.lastRefusedAt).toBe("string")
 	} finally {
 		await second.stop()
