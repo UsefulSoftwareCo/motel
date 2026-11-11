@@ -53,6 +53,10 @@ export const config = {
 		maxPendingIngest: parsePositiveInt(process.env.MOTEL_OTEL_MAX_PENDING_INGEST, 16),
 		maxIngestBytes: parsePositiveInt(process.env.MOTEL_OTEL_MAX_INGEST_BYTES, 16 * 1024 * 1024),
 		retentionTraceBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_TRACE_BATCH, 100),
+		// Spans one eviction batch deletes at most, beyond its first trace. A batch is one
+		// uninterrupted run of deletes, so it is bounded by the rows it touches, not by traces:
+		// 100 large traces took seconds and held every export waiting behind it.
+		retentionSpanBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_SPAN_BATCH, 1_000),
 		retentionLogBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_LOG_BATCH, 5_000),
 		retentionIntervalSeconds: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_INTERVAL_SECONDS, 10),
 	},

@@ -36,7 +36,8 @@ const bounds = {
 } as const
 
 /** Start the built worker; given the directory of a stopped collector, on that collector's store. */
-const startCollector = async (settings: Partial<Record<keyof typeof bounds, number>> = {}, reuse?: string) => {
+type Setting = keyof typeof bounds | "MOTEL_OTEL_RETENTION_PASS_BUDGET_MS" | "MOTEL_OTEL_RETENTION_SPAN_BATCH"
+const startCollector = async (settings: Partial<Record<Setting, number>> = {}, reuse?: string) => {
 	const directory = reuse ?? (await mkdtemp(path.join(tmpdir(), "motel-bounds-")))
 	const port = await freePort()
 	const inspector = await freePort()
@@ -304,6 +305,36 @@ test("workerd collector at its size bound stores an idle trickle of exports with
 	// One pass emptied the store to its low-water mark; none ran for the idle exports.
 	expect(evictions).toEqual({ passes: 1, traces: expect.any(Number) })
 	expect((await storedTelemetry(collector.directory)).bytes).toBeLessThanOrEqual(cap * mebibyte)
+	await rm(collector.directory, { recursive: true, force: true })
+}, 120_000)
+
+test("workerd collector evicts a full store of large traces in batches bounded by spans", async () => {
+	// One eviction batch is one uninterrupted run of deletes that every export waits behind. A
+	// batch of the 100 oldest traces held the collector for seconds once traces were large, so
+	// exports timed out, were sent again, and the resends made the store slower still.
+	// With a one-millisecond budget each pass runs exactly one batch.
+	const collector = await startCollector({
+		MOTEL_OTEL_MAX_SPANS: 10_000_000,
+		MOTEL_OTEL_MAX_DB_SIZE_MB: 4,
+		MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: 3_600,
+		MOTEL_OTEL_RETENTION_PASS_BUDGET_MS: 1,
+		MOTEL_OTEL_RETENTION_SPAN_BATCH: 200,
+	})
+	let evictions = { passes: 0, traces: 0 }
+	try {
+		// Exports of ten 40-span traces until the store has evicted for a while.
+		for (let tick = 0; tick < 200 && evictions.passes < 20; tick++) {
+			const response = await post(collector.origin, JSON.stringify(traceExport(400)))
+			expect(response.status).toBe(200)
+			await response.arrayBuffer()
+			evictions = ((await (await fetch(`${collector.origin}/api/ingest`)).json()) as { evictions: typeof evictions }).evictions
+		}
+	} finally {
+		await collector.stop()
+	}
+	expect(evictions.passes).toBeGreaterThanOrEqual(20)
+	// 200 spans is five 40-span traces.
+	expect(evictions.traces).toBeLessThanOrEqual(evictions.passes * 5)
 	await rm(collector.directory, { recursive: true, force: true })
 }, 120_000)
 
