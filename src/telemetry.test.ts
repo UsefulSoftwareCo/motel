@@ -13,6 +13,7 @@ describe("motel telemetry store", () => {
 	const previousRetentionHours = process.env.MOTEL_OTEL_RETENTION_HOURS
 	let storeRuntime: Awaited<typeof import("./runtime.ts")>["storeRuntime"]
 	let TelemetryStore: Awaited<typeof import("./services/TelemetryStore.ts")>["TelemetryStore"]
+	let makeTelemetryStoreEffect: Awaited<typeof import("./services/TelemetryStore.ts")>["makeTelemetryStoreEffect"]
 	let motelOpenApiSpec: Awaited<typeof import("./httpApi.ts")>["motelOpenApiSpec"]
 
 	beforeAll(async () => {
@@ -20,7 +21,7 @@ describe("motel telemetry store", () => {
 		process.env.MOTEL_OTEL_RETENTION_HOURS = "24"
 		const suffix = `?test=${Date.now()}`
 		;({ storeRuntime } = await import(`./runtime.ts${suffix}`))
-		;({ TelemetryStore } = await import(`./services/TelemetryStore.ts${suffix}`))
+		;({ TelemetryStore, makeTelemetryStoreEffect } = await import(`./services/TelemetryStore.ts${suffix}`))
 		;({ motelOpenApiSpec } = await import(`./httpApi.ts${suffix}`))
 
 		const nowNanos = BigInt(Date.now()) * 1_000_000n
@@ -1151,5 +1152,180 @@ describe("motel telemetry store", () => {
 		expect(again).toHaveLength(1)
 		expect(renamed.map((item) => item.span.operationName)).toEqual(["reexport.renamed"])
 		expect(previous).toHaveLength(0)
+	})
+
+	it("rolls back a retention pass that fails part-way, leaving no search rows for deleted spans", async () => {
+		// A pass deletes each batch's spans, then deletes their operation-index rows once for the
+		// whole pass. A failure in between must not keep the first and lose the second: the index
+		// would keep rows for spans that are gone, and nothing would know to delete them.
+		const path = join(tempDir, "failed-pass.sqlite")
+		const sqlite = new Database(path)
+		let armed = false
+		let sizeReads = 0
+		const database = {
+			exec: (sql: string) => {
+				sqlite.exec(sql)
+			},
+			query: (sql: string) => sqlite.query(sql),
+			transaction: <A extends unknown[], B>(run: (...args: A) => B) => sqlite.transaction(run) as (...args: A) => B,
+			usedBytes: () => {
+				// The first read opens the pass; the second follows its first batch's deletes.
+				if (armed && ++sizeReads === 2) throw new Error("injected failure after a batch")
+				const one = (name: string) => Number(Object.values(sqlite.query(`PRAGMA ${name}`).get() as object)[0])
+				return (one("page_count") - one("freelist_count")) * one("page_size")
+			},
+			reclaim: () => {},
+			checkpoint: () => {},
+			optimize: () => {},
+		}
+		const old = BigInt(Date.now() - 48 * 60 * 60 * 1000) * 1_000_000n
+		const counts = () => ({
+			spans: (sqlite.query(`SELECT COUNT(*) AS c FROM spans WHERE trace_id = 'failed-pass-trace'`).get() as { c: number }).c,
+			search: (sqlite.query(`SELECT COUNT(*) AS c FROM span_operation_fts WHERE trace_id = 'failed-pass-trace'`).get() as { c: number }).c,
+		})
+		try {
+			const [failed, afterFailure, afterRetry] = await Effect.runPromise(
+				Effect.scoped(
+					Effect.gen(function* () {
+						const store = yield* makeTelemetryStoreEffect(database as never, { readonly: false, runRetention: false })
+						yield* store.ingestTraces({
+							resourceSpans: [{
+								resource: { attributes: [{ key: "service.name", value: { stringValue: "failed-pass" } }] },
+								scopeSpans: [{ spans: ["a", "b"].map((id, index) => ({
+									traceId: "failed-pass-trace",
+									spanId: `failed-pass-${id}`,
+									name: `failed.pass.${id}`,
+									startTimeUnixNano: String(old + BigInt(index) * 1_000_000n),
+									endTimeUnixNano: String(old + BigInt(index + 1) * 1_000_000n),
+								})) }],
+							}],
+						})
+						armed = true
+						const failed = yield* Effect.exit(store.runRetentionNow)
+						const afterFailure = counts()
+						armed = false
+						yield* store.runRetentionNow
+						return [failed._tag, afterFailure, counts()] as const
+					}),
+				).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+			)
+			expect(failed).toBe("Failure")
+			// Nothing of the failed pass was kept.
+			expect(afterFailure).toEqual({ spans: 2, search: 2 })
+			// The next pass evicts the trace and its search rows together.
+			expect(afterRetry).toEqual({ spans: 0, search: 0 })
+		} finally {
+			sqlite.close()
+		}
+	})
+
+	it("fails and rolls back a retention pass whose search-index delete fails", async () => {
+		// The pass's delete from the operation index used to swallow any error, so the spans' deletion
+		// was kept and their index rows were left for good.
+		const path = join(tempDir, "failed-index-delete.sqlite")
+		const sqlite = new Database(path)
+		let armed = false
+		const database = {
+			exec: (sql: string) => {
+				sqlite.exec(sql)
+			},
+			query: (sql: string) => {
+				const statement = sqlite.query(sql)
+				if (!sql.startsWith("DELETE FROM span_operation_fts WHERE trace_id IN")) return statement
+				return { ...statement, all: statement.all.bind(statement), get: statement.get.bind(statement), run: (...values: Array<never>) => {
+					if (armed) throw new Error("injected index failure")
+					return statement.run(...values)
+				} }
+			},
+			transaction: <A extends unknown[], B>(run: (...args: A) => B) => sqlite.transaction(run) as (...args: A) => B,
+			usedBytes: () => {
+				const one = (name: string) => Number(Object.values(sqlite.query(`PRAGMA ${name}`).get() as object)[0])
+				return (one("page_count") - one("freelist_count")) * one("page_size")
+			},
+			reclaim: () => {},
+			checkpoint: () => {},
+			optimize: () => {},
+		}
+		const old = BigInt(Date.now() - 48 * 60 * 60 * 1000) * 1_000_000n
+		const counts = () => ({
+			spans: (sqlite.query(`SELECT COUNT(*) AS c FROM spans WHERE trace_id = 'failed-index-trace'`).get() as { c: number }).c,
+			search: (sqlite.query(`SELECT COUNT(*) AS c FROM span_operation_fts WHERE trace_id = 'failed-index-trace'`).get() as { c: number }).c,
+		})
+		try {
+			const [failed, afterFailure, afterRetry] = await Effect.runPromise(
+				Effect.scoped(
+					Effect.gen(function* () {
+						const store = yield* makeTelemetryStoreEffect(database as never, { readonly: false, runRetention: false })
+						yield* store.ingestTraces({
+							resourceSpans: [{
+								resource: { attributes: [{ key: "service.name", value: { stringValue: "failed-index" } }] },
+								scopeSpans: [{ spans: ["a", "b"].map((id, index) => ({
+									traceId: "failed-index-trace",
+									spanId: `failed-index-${id}`,
+									name: `failed.index.${id}`,
+									startTimeUnixNano: String(old + BigInt(index) * 1_000_000n),
+									endTimeUnixNano: String(old + BigInt(index + 1) * 1_000_000n),
+								})) }],
+							}],
+						})
+						armed = true
+						const failed = yield* Effect.exit(store.runRetentionNow)
+						const afterFailure = counts()
+						armed = false
+						yield* store.runRetentionNow
+						return [failed._tag, afterFailure, counts()] as const
+					}),
+				).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+			)
+			expect(failed).toBe("Failure")
+			expect(afterFailure).toEqual({ spans: 2, search: 2 })
+			expect(afterRetry).toEqual({ spans: 0, search: 0 })
+		} finally {
+			sqlite.close()
+		}
+	})
+
+	it("stores an identical resent export without rewriting its rows", async () => {
+		const now = BigInt(Date.now()) * 1_000_000n
+		const span = (spanId: string, offset: bigint) => ({
+			traceId: "resent-trace",
+			spanId,
+			name: `resent.${spanId}`,
+			startTimeUnixNano: String(now + offset),
+			endTimeUnixNano: String(now + offset + 5_000_000n),
+			attributes: [{ key: "resent.key", value: { stringValue: spanId } }],
+		})
+		const exported = {
+			resourceSpans: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "resent" } }] },
+				scopeSpans: [{ spans: [span("resent-a", 0n), span("resent-b", 1_000_000n)] }],
+			}],
+		}
+		const rows = () => {
+			const probe = new Database(dbPath, { readonly: true })
+			try {
+				return {
+					spans: probe.query(`SELECT rowid, span_id FROM spans WHERE trace_id = 'resent-trace' ORDER BY span_id`).all(),
+					attributes: probe.query(`SELECT rowid, span_id, key FROM span_attributes WHERE trace_id = 'resent-trace' ORDER BY span_id, key`).all(),
+				}
+			} finally {
+				probe.close()
+			}
+		}
+		const [first, again] = await storeRuntime.runPromise(
+			Effect.gen(function* () {
+				const store = yield* TelemetryStore
+				const first = yield* store.ingestTraces(exported)
+				const before = rows()
+				// The exporter timed out waiting for the acknowledgement and sends the same export again.
+				const again = yield* store.ingestTraces(exported)
+				return [{ result: first, rows: before }, { result: again, rows: rows() }] as const
+			}).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+		expect(first.result).toEqual({ insertedSpans: 2 })
+		expect(again.result).toEqual({ insertedSpans: 2 })
+		expect(first.rows.attributes.length).toBeGreaterThan(0)
+		// Same rows, not deleted and inserted again.
+		expect(again.rows).toEqual(first.rows)
 	})
 })

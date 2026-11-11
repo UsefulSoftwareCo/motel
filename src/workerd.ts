@@ -5,7 +5,7 @@ import { config } from "./config.js"
 import { motelApi } from "./httpServer.js"
 import { AsyncIngest } from "./services/AsyncIngest.js"
 import { IngestError } from "./services/ingestRpc.js"
-import { makeTelemetryStoreEffect, TelemetryStoreReadonly, type TelemetryStore } from "./services/TelemetryStore.js"
+import { makeTelemetryStoreEffect, StoreOverBound, TelemetryStoreReadonly, type TelemetryStore } from "./services/TelemetryStore.js"
 import { workerdDatabase } from "./services/TelemetryStoreWorkerd.js"
 import { TraceExport, LogExport } from "./otlpSchema.js"
 import { decodeProtobufLogs, decodeProtobufTraces } from "./otlpProtobuf.js"
@@ -29,6 +29,20 @@ const health = () => ({
 })
 
 const ingestPaths = new Set(["/v1/traces", "/v1/logs"])
+/**
+ * The path a request names as the typed routes match it: percent-decoded, case-insensitive, with
+ * repeated and trailing slashes ignored. Every spelling of an ingest path takes the bounded ingest
+ * route; the store refuses over-bound exports from any route anyway.
+ */
+const ingestPath = (pathname: string) => {
+	let decoded = pathname
+	try {
+		decoded = decodeURIComponent(pathname)
+	} catch {
+		// A malformed escape is matched as written.
+	}
+	return decoded.toLowerCase().replace(/\/{2,}/g, "/").replace(/(.)\/+$/, "$1")
+}
 const refusalLogInterval = 60_000
 
 /** Read a body without a declared length, giving up once it exceeds `limit` bytes. */
@@ -51,8 +65,8 @@ const boundedText = async (request: Request, limit: number): Promise<string | un
 }
 
 /** Why the collector did not store an export. Each is counted; see `MotelCollector.ingestStatus`. */
-type Loss = "queueFull" | "tooLarge" | "invalid" | "storeFailed"
-const losses: ReadonlyArray<Loss> = ["queueFull", "tooLarge", "invalid", "storeFailed"]
+type Loss = "queueFull" | "tooLarge" | "invalid" | "storeFailed" | "overBound"
+const losses: ReadonlyArray<Loss> = ["queueFull", "tooLarge", "invalid", "storeFailed", "overBound"]
 interface LossCounts {
 	/** Exports not stored, by reason. */
 	readonly refused: Record<Loss, number>
@@ -87,7 +101,7 @@ export class MotelCollector {
 		// The actor owns one connection and bootstrap. No native handle or detached fiber
 		// escapes this scoped construction; durable alarms own subsequent maintenance.
 		this.store = state.blockConcurrencyWhile(() =>
-			Effect.runPromise(Effect.scoped(makeTelemetryStoreEffect(workerdDatabase(state.storage), { readonly: false, runRetention: false }))),
+			Effect.runPromise(Effect.scoped(makeTelemetryStoreEffect(workerdDatabase(state.storage), { readonly: false, runRetention: false, refuseOverBound: true }))),
 		)
 		// A failed bootstrap is reported by each request that needs the store.
 		this.store.catch(() => {})
@@ -99,14 +113,14 @@ export class MotelCollector {
 					Schema.decodeUnknownEffect(TraceExport)(payload).pipe(
 						Effect.mapError(() => new IngestError({ message: "Invalid trace payload" })),
 						Effect.flatMap((parsed) =>
-							store.ingestTraces(parsed).pipe(Effect.mapError(() => new IngestError({ message: "Trace storage failed" }))),
+							store.ingestTraces(parsed).pipe(Effect.mapError((cause) => this.ingestError(cause, "Trace storage failed"))),
 						),
 					),
 				ingestLogs: ({ payload }) =>
 					Schema.decodeUnknownEffect(LogExport)(payload).pipe(
 						Effect.mapError(() => new IngestError({ message: "Invalid log payload" })),
 						Effect.flatMap((parsed) =>
-							store.ingestLogs(parsed).pipe(Effect.mapError(() => new IngestError({ message: "Log storage failed" }))),
+							store.ingestLogs(parsed).pipe(Effect.mapError((cause) => this.ingestError(cause, "Log storage failed"))),
 						),
 					),
 			})
@@ -123,6 +137,15 @@ export class MotelCollector {
 		this.handler.catch(() => {})
 	}
 
+	/** An export the typed routes could not store; one refused over the size bound is counted as such. */
+	private ingestError(cause: unknown, message: string) {
+		if (cause instanceof StoreOverBound) {
+			this.refuse("overBound", 0, cause.message, 429)
+			return new IngestError({ message: cause.message })
+		}
+		return new IngestError({ message })
+	}
+
 	/** Serve through the same typed HTTP routes as the native collector. */
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url)
@@ -130,7 +153,7 @@ export class MotelCollector {
 			const evictions = await this.store.then((store) => store.evictions(), () => null)
 			return Response.json({ ...this.ingestStatus(), evictions })
 		}
-		if (request.method === "POST" && ingestPaths.has(url.pathname)) return this.ingest(request)
+		if (request.method === "POST" && ingestPaths.has(ingestPath(url.pathname))) return this.ingest(request)
 		return this.serve(request)
 	}
 
@@ -162,7 +185,7 @@ export class MotelCollector {
 		}
 		this.pending += 1
 		try {
-			const signal = new URL(request.url).pathname === "/v1/traces" ? "traces" : "logs"
+			const signal = ingestPath(new URL(request.url).pathname) === "/v1/traces" ? "traces" : "logs"
 			const protobuf = /application\/(x-)?protobuf/i.test(request.headers.get("content-type") ?? "")
 			if (declared === null && protobuf) return Response.json({ error: "Protobuf exports need a Content-Length" }, { status: 411 })
 			let payload: unknown
@@ -210,10 +233,16 @@ export class MotelCollector {
 			if ((await this.state.storage.getAlarm()) === null) {
 				await this.state.storage.setAlarm(Date.now() + config.otel.retentionIntervalSeconds * 1000)
 			}
-			// Each export is stored before the response, then the size bound is held again.
+			// Each export is stored before the response, then the size bound is held again. A store
+			// still over its bound after an eviction pass refuses the export instead of storing it:
+			// storing anyway let ingest faster than eviction grow the store without limit. Refused,
+			// the exporter resends after Retry-After or drops the batch.
 			const result = await Effect.runPromise(Effect.tap(stored, () => store.holdSizeBound))
 			return Response.json(result)
 		} catch (cause) {
+			if (cause instanceof StoreOverBound) {
+				return this.refuse("overBound", bytes, cause.message, 429, { "retry-after": "1" })
+			}
 			return this.refuse("storeFailed", bytes, `The ${signal} export could not be stored`, 500, {}, cause)
 		}
 	}

@@ -156,6 +156,29 @@ type InternalTraceSpanItem = TraceSpanItem & {
 
 const isSpanRunning = (startTimeMs: number, endTimeMs: number) => endTimeMs <= 0 || endTimeMs < startTimeMs
 
+const storedSpanColumns = [
+	"parent_span_id",
+	"service_name",
+	"scope_name",
+	"operation_name",
+	"kind",
+	"start_time_ms",
+	"end_time_ms",
+	"status",
+	"attributes_json",
+	"resource_json",
+	"events_json",
+] as const
+
+/** Whether a stored span row already holds exactly these values, in `storedSpanColumns` order. */
+const sameStoredSpan = (stored: unknown, values: ReadonlyArray<string | number | null>) => {
+	const row = stored as Record<(typeof storedSpanColumns)[number], unknown>
+	return storedSpanColumns.every((column, index) => {
+		const value = row[column]
+		return (typeof value === "bigint" ? Number(value) : value) === values[index]
+	})
+}
+
 const liveDurationMs = (startTimeMs: number, endTimeMs: number, isRunning: boolean) =>
 	Math.max(0, (isRunning ? Date.now() : endTimeMs) - startTimeMs)
 
@@ -513,6 +536,21 @@ export class TelemetryStore extends Context.Service<
 export interface TelemetryStoreOptions {
 	readonly readonly: boolean
 	readonly runRetention: boolean
+	/**
+	 * Refuse an export, with `StoreOverBound`, while the store is over `MOTEL_OTEL_MAX_DB_SIZE_MB`
+	 * after one eviction pass, instead of storing it. Set by the workerd collector, which answers
+	 * the refusal with 429 and Retry-After; the native daemon holds its bound with its retention
+	 * loop and stores every export, as before.
+	 */
+	readonly refuseOverBound?: boolean
+}
+
+/** An export the store refused because it is over its size bound and eviction has not caught up. */
+export class StoreOverBound extends Error {
+	readonly _tag = "StoreOverBound"
+	constructor() {
+		super("Telemetry store is over its size bound")
+	}
 }
 
 /** Construct the shared query and ingest logic over an owned SQLite connection. */
@@ -804,7 +842,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		// the whole index. Only a span stored before has a row to replace; a new span, almost every
 		// one, is only inserted. Deleting for every span made each export cost time in proportion
 		// to everything already stored.
-		const spanExists = db.query(`SELECT 1 AS found FROM spans WHERE trace_id = ? AND span_id = ?`)
+		const storedSpan = db.query(`SELECT ${storedSpanColumns.join(", ")} FROM spans WHERE trace_id = ? AND span_id = ?`)
 		const deleteSpanOperationSearchMany = (spans: ReadonlyArray<readonly [string, string]>) => {
 			if (spans.length > 0) deleteSpanOperationSearch.run(JSON.stringify(spans))
 		}
@@ -869,7 +907,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
 
-			yield* Effect.sync(() => {
+			const pass = () => {
 				const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
 
 				// Evict at TRACE granularity so we never leave a trace half-gutted
@@ -878,11 +916,10 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				// are protected — only `active_span_count = 0` summaries are in
 				// scope for eviction.
 				//
-				// Every bound holds after each pass, not eventually: one pass evicts
-				// batches until the store is back within its age, span-count and size
-				// bounds, so a sustained ingest rate above one batch per interval
-				// cannot outgrow them. A time budget keeps the pass from holding the
-				// single writer for long; the next interval continues from there.
+				// A pass evicts batches until the store is back within its age, span-count and
+				// size bounds or its time budget runs out; the next pass continues from there.
+				// With `refuseOverBound`, exports cannot outgrow the size bound meanwhile: the store
+				// refuses them while it is still over it.
 				const passStarted = Date.now()
 				let spans = Number((db.query(`SELECT COALESCE(SUM(span_count), 0) AS value FROM trace_summaries`).get() as { value: number }).value)
 				let dbSize = db.usedBytes()
@@ -892,14 +929,47 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				let evictedTraces = 0
 				let deletedLogs = false
 				let deletedOrphans = false
+				// What a pass costs: batches until the budget runs out, checked between batches, so
+				// the budget plus one batch, where a batch that deleted logs includes the two log
+				// orphan sweeps, which read their whole tables; then one delete from the operation
+				// index for everything it evicted, which reads that whole index. A batch holds at most `retentionSpanBatch` spans, except that its first trace
+				// is always taken whole, however large. Nothing here bounds the index scan or a single
+				// very large trace by time.
+				const evictedTraceIds: Array<string> = []
+				// Log-side orphans (log_attributes + FTS) are keyed by log.id, so prune what no longer
+				// has a parent log row. Each sweep reads its whole table.
+				let swept = false
+				const sweepOrphans = () => {
+					swept = true
+					const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
+					deletedOrphans = deletedOrphans || Number(orphanAttributes.changes) > 0
+					if (hasFts) {
+						const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
+						deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
+					}
+				}
 				while (Date.now() - passStarted < config.otel.retentionPassBudgetMs) {
 					const toEvict = new Map<string, number>()
+					// Spans in this batch: it stops before a trace that would take it past
+					// `retentionSpanBatch`, unless that trace is its first.
+					let batchSpans = 0
+					let capped = false
+					const take = (row: { trace_id: string; span_count: number }) => {
+						if (toEvict.has(row.trace_id)) return true
+						if (toEvict.size > 0 && batchSpans + row.span_count > config.otel.retentionSpanBatch) {
+							capped = true
+							return false
+						}
+						toEvict.set(row.trace_id, row.span_count)
+						batchSpans += row.span_count
+						return true
+					}
 
 					// Time-based: completed traces whose last span ended before cutoff.
 					const timeExpired = db.query(
 						`SELECT trace_id, span_count FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ? ORDER BY ended_at_ms ASC LIMIT ?`,
 					).all(cutoff, config.otel.retentionTraceBatch) as readonly { trace_id: string; span_count: number }[]
-					for (const row of timeExpired) toEvict.set(row.trace_id, row.span_count)
+					for (const row of timeExpired) if (!take(row)) break
 
 					// Count and size: drop the oldest completed traces until the excess is
 					// gone. Size is converted to spans at the store's current bytes per
@@ -910,15 +980,24 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						dbSize > sizeTarget && spans > 0 ? Math.ceil((dbSize - sizeTarget) / (dbSize / spans)) : 0,
 						dbSize > sizeTarget ? 1 : 0,
 					)
-					if (excess > 0) {
+					if (excess > 0 && !capped) {
 						const oldest = db.query(
 							`SELECT trace_id, span_count FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
 						).all(config.otel.retentionTraceBatch) as readonly { trace_id: string; span_count: number }[]
-						let selected = 0
 						for (const row of oldest) {
-							if (selected >= excess) break
-							if (!toEvict.has(row.trace_id)) selected += row.span_count
-							toEvict.set(row.trace_id, row.span_count)
+							if (batchSpans >= excess || !take(row)) break
+						}
+						// The size bound wins over keeping running traces whole. A store over its bound
+						// whose every trace still has a running span would otherwise evict nothing, and
+						// with exports refused while it is over, the spans that would end those traces
+						// could never arrive.
+						if (toEvict.size === 0 && dbSize > maxDbSizeBytes) {
+							const running = db.query(
+								`SELECT trace_id, span_count FROM trace_summaries ORDER BY started_at_ms ASC LIMIT ?`,
+							).all(config.otel.retentionTraceBatch) as readonly { trace_id: string; span_count: number }[]
+							for (const row of running) {
+								if (batchSpans >= excess || !take(row)) break
+							}
 						}
 					}
 
@@ -931,7 +1010,6 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 						const oversizedLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY timestamp_ms ASC LIMIT ?)`).run(config.otel.retentionLogBatch)
 						deletedLogsNow = deletedLogsNow || Number(oversizedLogs.changes) > 0
 					}
-					deletedLogs = deletedLogs || deletedLogsNow
 
 					// Each batch wipes every row reachable from those trace_ids
 					// across the cascade tables.
@@ -940,26 +1018,18 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
 						const batch = JSON.stringify(traceIds.slice(offset, offset + BATCH_SIZE))
 						db.query(`DELETE FROM span_attributes WHERE trace_id IN ${jsonValues}`).run(batch)
-						try {
-							db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(batch)
-						} catch {
-							// FTS table may not exist on old DBs.
-						}
 						db.query(`DELETE FROM spans WHERE trace_id IN ${jsonValues}`).run(batch)
-						db.query(`DELETE FROM logs WHERE trace_id IN ${jsonValues}`).run(batch)
+						const tracedLogs = db.query(`DELETE FROM logs WHERE trace_id IN ${jsonValues}`).run(batch)
+						deletedLogsNow = deletedLogsNow || Number(tracedLogs.changes) > 0
 						db.query(`DELETE FROM trace_summaries WHERE trace_id IN ${jsonValues}`).run(batch)
 					}
 
-					// Log-side orphans (log_attributes + FTS) are keyed by log.id,
-					// so prune what no longer has a parent log row.
-					const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
-					deletedOrphans = deletedOrphans || Number(orphanAttributes.changes) > 0
-					try {
-						const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
-						deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
-					} catch {
-						// FTS table may not exist on old DBs.
-					}
+					evictedTraceIds.push(...traceIds)
+					deletedLogs = deletedLogs || deletedLogsNow
+					// A deleted log's attributes and body index rows are most of its size, and only the
+					// orphan sweeps remove them, so a batch that deleted logs sweeps before it measures
+					// the store; otherwise the pass would see no room freed and delete every log.
+					if (deletedLogsNow) sweepOrphans()
 
 					for (const count of toEvict.values()) spans -= count
 					evictedTraces += toEvict.size
@@ -967,20 +1037,45 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 					dbSize = db.usedBytes()
 					// Nothing left to evict, or every bound holds again.
 					if (toEvict.size === 0 && !deletedLogsNow) break
-					const backlog = timeExpired.length === config.otel.retentionTraceBatch || Number(expiredLogs.changes) === config.otel.retentionLogBatch
+					const backlog = capped || timeExpired.length === config.otel.retentionTraceBatch || Number(expiredLogs.changes) === config.otel.retentionLogBatch
 					if (spans <= spanTarget && dbSize <= sizeTarget && !backlog) break
 					// Some deletions free pages only after a later merge or checkpoint. When a
 					// pass freed nothing measurable, wait for that rather than evict more.
 					if (spans <= spanTarget && !backlog && dbSize >= sizeBefore) break
 				}
+				// The operation index names its trace only in an UNINDEXED column, so a delete from it
+				// reads the whole index; one delete covers every trace this pass evicted.
+				// A failure here fails the pass, and its transaction leaves nothing half-deleted.
+				if (evictedTraceIds.length > 0 && hasFts) {
+					db.query(`DELETE FROM span_operation_fts WHERE trace_id IN ${jsonValues}`).run(JSON.stringify(evictedTraceIds))
+				}
+				// A pass whose batches deleted no logs still sweeps once, for orphans left by anything else.
+				if (!swept) sweepOrphans()
+
 				// Stop draining at the low-water mark, or when nothing was left to evict: a store
 				// whose remaining traces are all still running waits for them to finish.
 				if ((spans <= lowWaterSpans && dbSize <= lowWaterBytes) || (evictedTraces === 0 && !deletedLogs)) setDraining(false)
-				if (evictedTraces > 0) {
-					evictions.passes += 1
-					evictions.traces += evictedTraces
-				}
+				return { evictedTraces, deletedLogs, deletedOrphans }
+			}
 
+			// The pass's deletes commit together: a failure part-way through, after a batch's
+			// spans are gone but before their operation-index rows are, must not leave index rows
+			// for spans that no longer exist. workerd commits a synchronous run of writes
+			// atomically already; the native store needs the transaction.
+			const { evictedTraces, deletedLogs, deletedOrphans } = yield* Effect.try({
+				try: () => db.transaction(pass)(),
+				catch: (cause) => {
+					// The drain flag is cached; re-read what the rolled-back transaction left.
+					draining = undefined
+					return cause instanceof Error ? cause : new Error(String(cause))
+				},
+			})
+			if (evictedTraces > 0) {
+				evictions.passes += 1
+				evictions.traces += evictedTraces
+			}
+
+			yield* Effect.sync(() => {
 				// Checkpoint after a big delete pass so the freed pages land
 				// in the main DB file and become eligible for incremental
 				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
@@ -1079,8 +1174,17 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			if (opts.runRetention) yield* Effect.forkScoped(backfillAttrFts)
 		}
 
+		// Every stored export passes through `ingestTraces` or `ingestLogs`, whichever route or
+		// path spelling it arrived by, so the size bound is held here. The last check and the
+		// write run in one synchronous step, so no other export can be stored between them, and
+		// the store exceeds its bound by at most the rows one export writes.
+		const overBound = () => opts.refuseOverBound === true && db.usedBytes() > maxDbSizeBytes
+		const makeRoom = Effect.suspend(() => (overBound() ? cleanupExpired() : Effect.void))
+
 		const ingestTraces = Effect.fn("motel/TelemetryStore.ingestTraces")(function* (payload: OtlpTraceExportRequest) {
-			return yield* Effect.sync(() => {
+			yield* makeRoom
+			const stored = yield* Effect.sync(() => {
+				if (overBound()) return null
 				let insertedSpans = 0
 				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
 					const touchedTraceIds = new Set<string>()
@@ -1108,10 +1212,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									attributes: attributeMap(event.attributes),
 								}))
 
-								if (spanExists.get(traceId, spanId) !== null) replacedSpans.push([traceId, spanId])
-								insertSpan.run(
-									traceId,
-									spanId,
+								const row = [
 									parentSpanId,
 									serviceName,
 									scopeName,
@@ -1119,13 +1220,40 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 									spanKindLabel(span.kind),
 									startTimeMs,
 									endTimeMs,
-									Math.max(0, endTimeMs - startTimeMs),
 									spanStatusLabel(span.status?.code),
 									JSON.stringify(spanAttributes),
 									JSON.stringify(resourceAttributes),
 									JSON.stringify(events),
+								] as const
+								// An exporter resends an export the collector stored but did not acknowledge in
+								// time. Storing it again rewrote every row and index entry of each span, so a
+								// collector already too slow to answer got slower with each resend.
+								const stored = storedSpan.get(traceId, spanId)
+								if (stored !== null && sameStoredSpan(stored, row)) {
+									insertedSpans += 1
+									continue
+								}
+								if (stored !== null) {
+									replacedSpans.push([traceId, spanId])
+									deleteSpanAttributes.run(traceId, spanId)
+								}
+								const [parent, service, scope, operation, kind, start, end, status, attributesJson, resourceJson, eventsJson] = row
+								insertSpan.run(
+									traceId,
+									spanId,
+									parent,
+									service,
+									scope,
+									operation,
+									kind,
+									start,
+									end,
+									Math.max(0, end - start),
+									status,
+									attributesJson,
+									resourceJson,
+									eventsJson,
 								)
-								deleteSpanAttributes.run(traceId, spanId)
 								insertSpanAttributesMany(traceId, spanId, mergedAttributes)
 								touchedOperations.push([traceId, spanId, span.name ?? "unknown"])
 								touchedTraceIds.add(traceId)
@@ -1152,10 +1280,14 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				transaction(payload)
 				return { insertedSpans }
 			})
+			if (stored === null) return yield* Effect.fail(new StoreOverBound())
+			return stored
 		})
 
 		const ingestLogs = Effect.fn("motel/TelemetryStore.ingestLogs")(function* (payload: OtlpLogExportRequest) {
-			return yield* Effect.sync(() => {
+			yield* makeRoom
+			const stored = yield* Effect.sync(() => {
+				if (overBound()) return null
 				let insertedLogs = 0
 				const transaction = db.transaction((request: OtlpLogExportRequest) => {
 					const touchedLogBodies: Array<readonly [string, string]> = []
@@ -1204,6 +1336,8 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 				transaction(payload)
 				return { insertedLogs }
 			})
+			if (stored === null) return yield* Effect.fail(new StoreOverBound())
+			return stored
 		})
 
 		const listServices = Effect.fn("motel/TelemetryStore.listServices")(function* () {
@@ -2442,6 +2576,7 @@ export const makeTelemetryStoreEffect = (db: TelemetryDatabase, opts: TelemetryS
 			aiCallStats,
 			runRetentionNow: Effect.andThen(backfillBatch, Effect.andThen(reconcileTraceSummaries, cleanupExpired())),
 			holdSizeBound: Effect.suspend(() => (isDraining() || db.usedBytes() > maxDbSizeBytes ? cleanupExpired() : Effect.void)),
+
 			evictions: () => ({ ...evictions }),
 		})
 	})
